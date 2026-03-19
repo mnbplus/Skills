@@ -1,0 +1,30 @@
+{
+  "name": "resource-hunter",
+  "version": "2.0.0",
+  "description": "Unified public resource hunter for pan links, torrents, magnets, and public video URLs. Supports dual text/JSON output, source health tracking, and yt-dlp workflows.",
+  "author": "mnbplus",
+  "license": "MIT-0",
+  "tags": [
+    "resource",
+    "pan",
+    "torrent",
+    "magnet",
+    "video",
+    "yt-dlp",
+    "movie",
+    "anime",
+    "tv",
+    "music",
+    "software",
+    "book"
+  ],
+  "requires": {
+    "python": ">=3.8",
+    "bins": [
+      "yt-dlp"
+    ],
+    "optional_bins": [
+      "ffmpeg"
+    ]
+  }
+}

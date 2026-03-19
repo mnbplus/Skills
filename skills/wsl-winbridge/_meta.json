@@ -1,0 +1,19 @@
+{
+  "name": "wsl-winbridge",
+  "version": "1.0.0",
+  "description": "🪟 WSL→Windows 桥接桌面控制。专为 WSL+Windows 混合环境设计，PowerShell 引擎直接控制 Windows 桌面（窗口/VSCode/进程/截图），Python 引擎补充鼠标键盘输入。无需 API Key，开箱即用。",
+  "author": "mnbplus",
+  "license": "MIT-0",
+  "tags": [
+    "windows", "wsl", "desktop", "automation",
+    "screenshot", "mouse", "keyboard", "window",
+    "process", "vscode", "clipboard", "powershell",
+    "pyautogui", "bridge", "wsl2"
+  ],
+  "requires": {
+    "os": "windows+wsl",
+    "python": ">=3.8",
+    "pip": ["mss", "pyautogui", "Pillow", "pywin32"],
+    "note": "PowerShell 引擎 WSL 下开箱即用，pip 依赖仅 Python 鼠标键盘功能需要"
+  }
+}

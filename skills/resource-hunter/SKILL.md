@@ -1,0 +1,75 @@
+---
+name: resource-hunter
+description: Public resource hunter for movies, TV, anime, music, software, books, pan links, magnets, and public video URLs. Uses unified search routing, dual text/JSON output, and yt-dlp video workflows without login, API keys, or DRM bypass.
+---
+
+# Resource Hunter
+
+Use this skill when the user wants to:
+
+- Find public pan links, magnets, or torrent results
+- Search movies, TV, anime, music, software, or books
+- Handle a public video URL with `yt-dlp`
+- Get compact chat-ready results or structured JSON
+
+Do not use this skill for:
+
+- Private accounts, cookies, login-only sites, invite-only trackers
+- DRM, captchas, bypassing access controls, or restricted content
+- Legality guarantees or long-term availability guarantees
+
+## Main entrypoint
+
+```bash
+SKILL_DIR="$(openclaw skills path resource-hunter)/scripts"
+python3 "$SKILL_DIR/hunt.py" search "<query>"
+```
+
+Legacy entrypoints still work:
+
+```bash
+python3 "$SKILL_DIR/pansou.py" "<query>"
+python3 "$SKILL_DIR/torrent.py" "<query>"
+python3 "$SKILL_DIR/video.py" info "<url>"
+```
+
+## Default routing
+
+- Movie: pan first, torrent as supplement
+- TV: EZTV/TPB first, pan as supplement
+- Anime: Nyaa first, pan as supplement
+- Music, software, book: pan first
+- Public video URL: route to `video probe` / `video info`
+
+## Common commands
+
+```bash
+python3 "$SKILL_DIR/hunt.py" search "Oppenheimer 2023" --4k
+python3 "$SKILL_DIR/hunt.py" search "Breaking Bad S01E01" --tv
+python3 "$SKILL_DIR/hunt.py" search "进击的巨人 Attack on Titan" --anime --sub
+python3 "$SKILL_DIR/hunt.py" search "周杰伦 无损" --music
+python3 "$SKILL_DIR/hunt.py" search "Adobe Photoshop 2024" --software --channel pan
+python3 "$SKILL_DIR/hunt.py" video probe "https://www.bilibili.com/video/BV..."
+python3 "$SKILL_DIR/hunt.py" video download "https://youtu.be/..." balanced
+python3 "$SKILL_DIR/hunt.py" sources
+python3 "$SKILL_DIR/hunt.py" doctor
+```
+
+## Output modes
+
+- Default: short human-readable recommendations with reasons
+- `--json`: stable machine-readable payload with `query`, `intent`, `plan`, `results`, `warnings`, `source_status`, and `meta`
+
+## Notes for agent behavior
+
+- Prefer the main `hunt.py` entrypoint over directly composing lower-level scripts
+- Use `--quick` in chat when the user wants a short answer
+- Use `--json` when another tool or script will consume the output
+- If the user provides a public video URL, do not search pan/torrent first; go straight to the video pipeline
+- If the user explicitly wants only pan or only torrent, set `--channel pan` or `--channel torrent`
+
+## References
+
+- Detailed usage: `references/usage.md`
+- Internal structure and JSON schema: `references/architecture.md`
+- Source coverage and routing: `references/sources.md`
