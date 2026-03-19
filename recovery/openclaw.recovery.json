@@ -1,0 +1,290 @@
+{
+  "formatVersion": 1,
+  "source": "wsl:/home/maniubi/.openclaw/openclaw.json",
+  "stateDirPlaceholder": "${STATE_DIR}",
+  "requiredDirectories": [
+    "${STATE_DIR}",
+    "${STATE_DIR}/workspace",
+    "${STATE_DIR}/workspace-bot2",
+    "${STATE_DIR}/workspace-bot3",
+    "${STATE_DIR}/extensions/openclaw-qqbot"
+  ],
+  "requiredSecrets": [
+    "channels.qqbot.accounts.bot2.clientSecret",
+    "channels.qqbot.accounts.bot3.clientSecret",
+    "channels.qqbot.accounts.default.clientSecret",
+    "channels.qqbot.clientSecret",
+    "gateway.auth.token",
+    "models.providers.codex-rokwuky.apiKey",
+    "models.providers.hajimi.apiKey",
+    "models.providers.wataruu.apiKey",
+    "skills.entries.goplaces.apiKey",
+    "tools.web.search.gemini.apiKey"
+  ],
+  "config": {
+    "meta": {
+      "lastTouchedVersion": "2026.3.14",
+      "lastTouchedAt": "2026-03-18T14:22:13.846Z"
+    },
+    "wizard": {
+      "lastRunAt": "2026-03-17T18:19:00.780Z",
+      "lastRunVersion": "2026.3.14",
+      "lastRunCommand": "onboard",
+      "lastRunMode": "local"
+    },
+    "browser": {
+      "enabled": true,
+      "defaultProfile": "winchrome",
+      "profiles": {
+        "winchrome": {
+          "cdpUrl": "http://127.0.0.1:9222",
+          "attachOnly": true,
+          "color": "#4285F4"
+        }
+      }
+    },
+    "models": {
+      "mode": "merge",
+      "providers": {
+        "codex-rokwuky": {
+          "baseUrl": "https://codex.rokwuky.com/v1",
+          "apiKey": "__REDACTED__",
+          "api": "openai-responses",
+          "models": [
+            {
+              "id": "gpt-5.4",
+              "name": "GPT-5.4 (Rokwuky)",
+              "reasoning": false,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              },
+              "contextWindow": 128000,
+              "maxTokens": 16384,
+              "headers": {
+                "User-Agent": "Mozilla/5.0"
+              },
+              "compat": {
+                "supportsStore": false
+              }
+            }
+          ]
+        },
+        "hajimi": {
+          "baseUrl": "https://hajimi.zabc.net/v1",
+          "apiKey": "__REDACTED__",
+          "api": "openai-completions",
+          "models": [
+            {
+              "id": "claude-sonnet-4-6",
+              "name": "claude-sonnet-4-6 (Custom Provider)",
+              "reasoning": false,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              },
+              "contextWindow": 200000,
+              "maxTokens": 8192
+            }
+          ]
+        },
+        "wataruu": {
+          "baseUrl": "https://api.wataruu.me/v1",
+          "apiKey": "__REDACTED__",
+          "api": "openai-responses",
+          "models": [
+            {
+              "id": "gpt-5.4(xhigh)",
+              "name": "GPT-5.4 (Wataruu xhigh)",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              },
+              "contextWindow": 128000,
+              "maxTokens": 16384,
+              "compat": {
+                "supportsReasoningEffort": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    "agents": {
+      "defaults": {
+        "model": {
+          "primary": "wataruu/gpt-5.4(xhigh)",
+          "fallbacks": []
+        },
+        "models": {
+          "hajimi/claude-sonnet-4-6": {},
+          "wataruu/gpt-5.4(xhigh)": {}
+        },
+        "workspace": "${STATE_DIR}/workspace",
+        "maxConcurrent": 3,
+        "memorySearch": {
+          "enabled": false
+        },
+        "compaction": {
+          "mode": "safeguard"
+        },
+        "verboseDefault": "off",
+        "typingMode": "thinking",
+        "sandbox": {
+          "mode": "off",
+          "browser": {
+            "allowHostControl": true,
+            "autoStart": true
+          }
+        },
+        "thinkingDefault": "off"
+      }
+    },
+    "tools": {
+      "profile": "full",
+      "web": {
+        "search": {
+          "enabled": true,
+          "provider": "gemini",
+          "gemini": {
+            "apiKey": "__REDACTED__"
+          }
+        }
+      },
+      "exec": {
+        "host": "gateway",
+        "security": "full",
+        "ask": "off"
+      }
+    },
+    "commands": {
+      "native": "auto",
+      "nativeSkills": "auto",
+      "restart": true,
+      "ownerDisplay": "raw"
+    },
+    "session": {
+      "dmScope": "per-channel-peer"
+    },
+    "hooks": {
+      "internal": {
+        "enabled": true,
+        "entries": {
+          "boot-md": {
+            "enabled": true
+          },
+          "bootstrap-extra-files": {
+            "enabled": true
+          },
+          "command-logger": {
+            "enabled": true
+          },
+          "session-memory": {
+            "enabled": true
+          }
+        }
+      }
+    },
+    "channels": {
+      "qqbot": {
+        "enabled": true,
+        "appId": "1903490818",
+        "clientSecret": "__REDACTED__",
+        "markdownSupport": false,
+        "defaultAccount": "default",
+        "accounts": {
+          "default": {
+            "enabled": true,
+            "appId": "1903490818",
+            "clientSecret": "__REDACTED__",
+            "markdownSupport": false
+          },
+          "bot2": {
+            "enabled": true,
+            "appId": "1903347545",
+            "clientSecret": "__REDACTED__",
+            "markdownSupport": false,
+            "workspace": "${STATE_DIR}/workspace-bot2"
+          },
+          "bot3": {
+            "enabled": true,
+            "appId": "102840619",
+            "clientSecret": "__REDACTED__",
+            "markdownSupport": false,
+            "workspace": "${STATE_DIR}/workspace-bot3"
+          }
+        }
+      }
+    },
+    "gateway": {
+      "port": 18789,
+      "mode": "local",
+      "bind": "loopback",
+      "auth": {
+        "mode": "token",
+        "token": "__REDACTED__"
+      },
+      "tailscale": {
+        "mode": "off",
+        "resetOnExit": false
+      },
+      "nodes": {
+        "denyCommands": []
+      }
+    },
+    "skills": {
+      "install": {
+        "nodeManager": "npm"
+      },
+      "entries": {
+        "goplaces": {
+          "apiKey": "__REDACTED__"
+        }
+      }
+    },
+    "plugins": {
+      "allow": [
+        "openclaw-qqbot"
+      ],
+      "entries": {
+        "openclaw-qqbot": {
+          "enabled": true
+        }
+      },
+      "installs": {
+        "openclaw-qqbot": {
+          "source": "npm",
+          "spec": "@tencent-connect/openclaw-qqbot@1.6.3",
+          "installPath": "${STATE_DIR}/extensions/openclaw-qqbot",
+          "version": "1.6.3",
+          "resolvedName": "@tencent-connect/openclaw-qqbot",
+          "resolvedVersion": "1.6.3",
+          "resolvedSpec": "@tencent-connect/openclaw-qqbot@1.6.3",
+          "integrity": "sha512-RT1THKrA4JJAYldtSRKj75CjzlLao+eNO7nXwnmnbuzwX8uQ/ABjibHoRH+H4VM0/mblwNlxLGRD+lCgbTPikA==",
+          "shasum": "c2eac50eb2b82d8549e3ce82e26d8e6a940b8b4f",
+          "resolvedAt": "2026-03-18T14:20:59.898Z",
+          "installedAt": "2026-03-18T14:22:13.818Z"
+        }
+      }
+    }
+  }
+}
