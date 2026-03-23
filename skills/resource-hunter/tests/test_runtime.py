@@ -4,12 +4,13 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
 import resource_hunter.config as config
-from resource_hunter import packaging_smoke
+from resource_hunter import packaging_report, packaging_smoke
 from resource_hunter.cache import ResourceCache
 from resource_hunter.cli import _doctor_advice, _packaging_status
 from resource_hunter.config import default_download_dir, storage_root
@@ -712,3 +713,487 @@ def test_packaging_gate_script_reports_downloaded_artifact_drift_subprocess(tmp_
         f"{drift_path.resolve()}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
         in result.stderr
     )
+
+
+def test_packaging_report_script_reports_downloaded_artifact_drift_subprocess(tmp_path):
+    artifact_root = tmp_path / "downloaded-gh-artifacts"
+    _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+
+    result = _run_source_checkout_script("packaging_report.py", "--json", "--require-contract-ok", str(artifact_root))
+
+    expected_payload = packaging_report.read_packaging_baseline_reports([artifact_root])
+    expected_failures = packaging_report.packaging_baseline_report_requirement_failures(expected_payload)
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == expected_payload
+    for failure in expected_failures:
+        assert failure in result.stderr
+
+
+def test_packaging_gate_script_reports_downloaded_zip_directory_drift_subprocess(tmp_path):
+    downloads_root = tmp_path / "downloaded-gh-artifact-zips"
+    scratch_root = tmp_path / "scratch"
+    ok_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    drift_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+    archive_path = downloads_root / "nested" / "downloaded-gh-artifacts.zip"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "job-a/packaging-baseline.json",
+            ok_path.read_text(encoding="utf-8"),
+        )
+        archive.writestr(
+            "job-b/packaging-baseline.json",
+            drift_path.read_text(encoding="utf-8"),
+        )
+
+    result = _run_source_checkout_script("packaging_gate.py", "--json", str(downloads_root))
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    drift_ref = f"{archive_path.resolve()}!/job-b/packaging-baseline.json"
+    assert payload == {
+        "gate_schema_version": 1,
+        "ok": False,
+        "failure_count": 1,
+        "failures": [
+            f"{drift_ref}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
+        ],
+        "report_type": "aggregate",
+        "summary": {
+            "artifact_count": 2,
+            "contract_ok_artifact_count": 1,
+            "contract_drift_artifact_count": 1,
+            "requirement_failed_artifact_count": 1,
+            "warning_count": 1,
+            "all_baseline_contracts_ok": False,
+        },
+        "artifacts_with_contract_drift": [drift_ref],
+        "artifacts_with_requirement_failures": [drift_ref],
+    }
+    assert (
+        f"{drift_ref}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
+        in result.stderr
+    )
+
+
+def test_packaging_gate_script_emits_json_error_payload_when_github_run_downloads_no_artifacts_subprocess(
+    tmp_path, monkeypatch
+):
+    fake_bin = tmp_path / "fake-gh-bin"
+    fake_bin.mkdir()
+    invocation_log = tmp_path / "fake-gh-invocation.json"
+    fake_gh_impl = fake_bin / "fake_gh.py"
+    fake_gh_impl.write_text(
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n\n"
+        f"INVOCATION_LOG = Path(r'''{invocation_log}''')\n\n"
+        "def main() -> int:\n"
+        "    args = sys.argv[1:]\n"
+        "    INVOCATION_LOG.write_text(json.dumps(args), encoding='utf-8')\n"
+        "    if args[:2] != ['run', 'download']:\n"
+        "        print(f'unexpected gh invocation: {args}', file=sys.stderr)\n"
+        "        return 1\n"
+        "    try:\n"
+        "        download_dir = Path(args[args.index('--dir') + 1])\n"
+        "    except (ValueError, IndexError):\n"
+        "        print('--dir is required', file=sys.stderr)\n"
+        "        return 1\n"
+        "    download_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    return 0\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        fake_gh = fake_bin / "gh.cmd"
+        fake_gh.write_text(
+            f'@echo off\r\n"{sys.executable}" "{fake_gh_impl}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            f'#!/bin/sh\n"{sys.executable}" "{fake_gh_impl}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+
+    original_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{original_path}")
+
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    result = _run_source_checkout_script(
+        "packaging_gate.py",
+        "--json",
+        "--github-run",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--download-dir",
+        str(download_dir),
+        "--require-artifact-count",
+        "2",
+    )
+
+    error = f"No packaging-baseline.json artifacts found under {download_dir.resolve()}."
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "gate_schema_version": 1,
+        "report_type": "error",
+        "summary": {},
+        "ok": False,
+        "failure_count": 1,
+        "failures": [error],
+        "error": error,
+        "expected_artifact_count": 2,
+        "download": {
+            "provider": "github-actions",
+            "run_id": "123456",
+            "repo": "openclaw/resource-hunter",
+            "download_dir": str(download_dir.resolve()),
+            "download_dir_source": "argument",
+            "download_dir_retained": True,
+            "artifact_names": [],
+            "artifact_patterns": ["resource-hunter-packaging-baseline-*"],
+            "artifact_filter_source": "default",
+            "resolved_artifact_count": 0,
+            "resolved_artifact_paths": [],
+            "resolved_archive_member_count": 0,
+            "resolved_filesystem_artifact_count": 0,
+            "download_command": payload["download"]["download_command"],
+        },
+    }
+    assert [part.lower() if isinstance(part, str) else part for part in payload["download"]["download_command"]] == [
+        str(fake_gh.resolve()).lower(),
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()).lower(),
+        "--pattern",
+        "resource-hunter-packaging-baseline-*",
+    ]
+    assert result.stderr.strip() == error
+    assert json.loads(invocation_log.read_text(encoding="utf-8")) == [
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()),
+        "--pattern",
+        "resource-hunter-packaging-baseline-*",
+    ]
+
+
+def test_packaging_report_script_reports_downloaded_zip_directory_drift_subprocess(tmp_path):
+    downloads_root = tmp_path / "downloaded-gh-artifact-zips"
+    scratch_root = tmp_path / "scratch"
+    ok_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    drift_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+    archive_path = downloads_root / "nested" / "downloaded-gh-artifacts.zip"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "job-a/packaging-baseline.json",
+            ok_path.read_text(encoding="utf-8"),
+        )
+        archive.writestr(
+            "job-b/packaging-baseline.json",
+            drift_path.read_text(encoding="utf-8"),
+        )
+
+    result = _run_source_checkout_script("packaging_report.py", "--json", "--require-contract-ok", str(downloads_root))
+
+    expected_payload = packaging_report.read_packaging_baseline_reports([downloads_root])
+    expected_failures = packaging_report.packaging_baseline_report_requirement_failures(expected_payload)
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == expected_payload
+    for failure in expected_failures:
+        assert failure in result.stderr
+
+
+def test_packaging_gate_script_downloads_github_run_artifacts_subprocess(tmp_path, monkeypatch):
+    seed_root = tmp_path / "seed-gh-artifacts"
+    _write_packaging_baseline_artifact(
+        seed_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    _write_packaging_baseline_artifact(
+        seed_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=True,
+    )
+    fake_bin = tmp_path / "fake-gh-bin"
+    fake_bin.mkdir()
+    invocation_log = tmp_path / "fake-gh-invocation.json"
+    fake_gh_impl = fake_bin / "fake_gh.py"
+    fake_gh_impl.write_text(
+        "import json\n"
+        "import shutil\n"
+        "import sys\n"
+        "from pathlib import Path\n\n"
+        f"SEED_ROOT = Path(r'''{seed_root}''')\n"
+        f"INVOCATION_LOG = Path(r'''{invocation_log}''')\n\n"
+        "def main() -> int:\n"
+        "    args = sys.argv[1:]\n"
+        "    INVOCATION_LOG.write_text(json.dumps(args), encoding='utf-8')\n"
+        "    if args[:2] != ['run', 'download']:\n"
+        "        print(f'unexpected gh invocation: {args}', file=sys.stderr)\n"
+        "        return 1\n"
+        "    try:\n"
+        "        download_dir = Path(args[args.index('--dir') + 1])\n"
+        "    except (ValueError, IndexError):\n"
+        "        print('--dir is required', file=sys.stderr)\n"
+        "        return 1\n"
+        "    download_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    for child in SEED_ROOT.iterdir():\n"
+        "        target = download_dir / child.name\n"
+        "        if target.exists():\n"
+        "            shutil.rmtree(target)\n"
+        "        shutil.copytree(child, target)\n"
+        "    return 0\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        fake_gh = fake_bin / "gh.cmd"
+        fake_gh.write_text(
+            f'@echo off\r\n"{sys.executable}" "{fake_gh_impl}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            f'#!/bin/sh\n"{sys.executable}" "{fake_gh_impl}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+
+    original_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{original_path}")
+
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    result = _run_source_checkout_script(
+        "packaging_gate.py",
+        "--json",
+        "--github-run",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--download-dir",
+        str(download_dir),
+        "--require-artifact-count",
+        "2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["expected_artifact_count"] == 2
+    assert payload["actual_artifact_count"] == 2
+    assert payload["download"] == {
+        "provider": "github-actions",
+        "run_id": "123456",
+        "repo": "openclaw/resource-hunter",
+        "download_dir": str(download_dir.resolve()),
+        "download_dir_source": "argument",
+        "download_dir_retained": True,
+        "artifact_names": [],
+        "artifact_patterns": ["resource-hunter-packaging-baseline-*"],
+        "artifact_filter_source": "default",
+        "resolved_artifact_count": 2,
+        "resolved_artifact_paths": [
+            str((download_dir / "resource-hunter-packaging-baseline-ubuntu-latest-py3.12" / "packaging-baseline.json").resolve()),
+            str((download_dir / "resource-hunter-packaging-baseline-windows-latest-py3.13" / "packaging-baseline.json").resolve()),
+        ],
+        "resolved_archive_member_count": 0,
+        "resolved_filesystem_artifact_count": 2,
+        "download_command": payload["download"]["download_command"],
+    }
+    assert [part.lower() if isinstance(part, str) else part for part in payload["download"]["download_command"]] == [
+        str(fake_gh.resolve()).lower(),
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()).lower(),
+        "--pattern",
+        "resource-hunter-packaging-baseline-*",
+    ]
+    assert json.loads(invocation_log.read_text(encoding="utf-8")) == [
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()),
+        "--pattern",
+        "resource-hunter-packaging-baseline-*",
+    ]
+
+
+def test_packaging_report_script_downloads_github_run_artifacts_subprocess(tmp_path, monkeypatch):
+    seed_root = tmp_path / "seed-gh-artifacts"
+    _write_packaging_baseline_artifact(
+        seed_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    _write_packaging_baseline_artifact(
+        seed_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+    fake_bin = tmp_path / "fake-gh-bin"
+    fake_bin.mkdir()
+    invocation_log = tmp_path / "fake-gh-invocation.json"
+    fake_gh_impl = fake_bin / "fake_gh.py"
+    fake_gh_impl.write_text(
+        "import json\n"
+        "import shutil\n"
+        "import sys\n"
+        "from pathlib import Path\n\n"
+        f"SEED_ROOT = Path(r'''{seed_root}''')\n"
+        f"INVOCATION_LOG = Path(r'''{invocation_log}''')\n\n"
+        "def main() -> int:\n"
+        "    args = sys.argv[1:]\n"
+        "    INVOCATION_LOG.write_text(json.dumps(args), encoding='utf-8')\n"
+        "    if args[:2] != ['run', 'download']:\n"
+        "        print(f'unexpected gh invocation: {args}', file=sys.stderr)\n"
+        "        return 1\n"
+        "    try:\n"
+        "        download_dir = Path(args[args.index('--dir') + 1])\n"
+        "    except (ValueError, IndexError):\n"
+        "        print('--dir is required', file=sys.stderr)\n"
+        "        return 1\n"
+        "    download_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    for child in SEED_ROOT.iterdir():\n"
+        "        target = download_dir / child.name\n"
+        "        if target.exists():\n"
+        "            shutil.rmtree(target)\n"
+        "        shutil.copytree(child, target)\n"
+        "    return 0\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        fake_gh = fake_bin / "gh.cmd"
+        fake_gh.write_text(
+            f'@echo off\r\n"{sys.executable}" "{fake_gh_impl}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            f'#!/bin/sh\n"{sys.executable}" "{fake_gh_impl}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+
+    original_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{original_path}")
+
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    result = _run_source_checkout_script(
+        "packaging_report.py",
+        "--json",
+        "--github-run",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--download-dir",
+        str(download_dir),
+        "--require-contract-ok",
+    )
+
+    expected_payload = packaging_report.attach_packaging_baseline_download_payload(
+        packaging_report.read_packaging_baseline_reports([download_dir]),
+        download_payload={
+            "provider": "github-actions",
+            "run_id": "123456",
+            "repo": "openclaw/resource-hunter",
+            "download_dir": str(download_dir.resolve()),
+            "download_dir_source": "argument",
+            "download_dir_retained": True,
+            "artifact_names": [],
+            "artifact_patterns": ["resource-hunter-packaging-baseline-*"],
+            "artifact_filter_source": "default",
+            "resolved_artifact_count": 2,
+            "resolved_artifact_paths": [
+                str((download_dir / "resource-hunter-packaging-baseline-ubuntu-latest-py3.12" / "packaging-baseline.json").resolve()),
+                str((download_dir / "resource-hunter-packaging-baseline-windows-latest-py3.13" / "packaging-baseline.json").resolve()),
+            ],
+            "resolved_archive_member_count": 0,
+            "resolved_filesystem_artifact_count": 2,
+            "download_command": [],
+        },
+    )
+    expected_failures = packaging_report.packaging_baseline_report_requirement_failures(expected_payload)
+
+    assert result.returncode == 2, result.stderr or result.stdout
+    payload = json.loads(result.stdout)
+    expected_payload["download"]["download_command"] = payload["download"]["download_command"]
+    assert payload == expected_payload
+    assert [part.lower() if isinstance(part, str) else part for part in payload["download"]["download_command"]] == [
+        str(fake_gh.resolve()).lower(),
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()).lower(),
+        "--pattern",
+        "resource-hunter-packaging-baseline-*",
+    ]
+    for failure in expected_failures:
+        assert failure in result.stderr
+    assert json.loads(invocation_log.read_text(encoding="utf-8")) == [
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()),
+        "--pattern",
+        "resource-hunter-packaging-baseline-*",
+    ]

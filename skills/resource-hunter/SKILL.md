@@ -72,6 +72,8 @@ python3 "$SKILL_DIR/hunt.py" packaging-smoke --json --python auto
 python3 "$SKILL_DIR/hunt.py" packaging-baseline --project-root /path/to/repo --python auto --bootstrap-build-deps --output-dir artifacts/packaging-baseline --require-expected-outcomes
 python3 "$SKILL_DIR/hunt.py" packaging-baseline-report artifacts/packaging-baseline/packaging-baseline.json
 python3 "$SKILL_DIR/hunt.py" packaging-baseline-report artifacts/downloaded-gh-artifacts --json --require-contract-ok
+python3 "$SKILL_DIR/packaging_report.py" --json artifacts/downloaded-gh-artifacts
+python3 "$SKILL_DIR/packaging_gate.py" artifacts/downloaded-gh-artifacts --json --require-artifact-count 6
 ```
 
 ## Output modes
@@ -126,7 +128,7 @@ python3 "$SKILL_DIR/hunt.py" packaging-smoke --json --python /bad/path
 - Use `--json` when another tool or script will consume the output
 - If the user provides a public video URL, do not search pan/torrent first; go straight to the video pipeline
 - When validating installability or CI readiness, run `doctor --json --require-packaging-ready` first and then `packaging-smoke --json`; both commands now report `project_root`, `project_root_source`, `packaging.project_root`, `packaging.project_root_source`, `packaging_python`, its source, and any probe failure in `packaging.error`, so add `--python` when the packaging-capable interpreter differs from the current launcher, set `RESOURCE_HUNTER_PACKAGING_PYTHON` once so both commands reuse the same target interpreter, or use `--python auto` / `RESOURCE_HUNTER_PACKAGING_PYTHON=auto` to scan the current interpreter, active envs, PATH, and the Windows `py` launcher for a packaging-ready fallback. Add `--project-root` when CI or ops runs outside the target checkout, and add `--bootstrap-build-deps` when lean runtimes should still count as installable because they can bootstrap the checkout's declared build requirements into a disposable overlay.
-- When consuming archived packaging baselines, `packaging-baseline-report` can read one baseline file, multiple explicit files, or a directory tree of downloaded CI artifacts; add `--json` for aggregate machine-readable output and `--require-contract-ok` when downstream automation should fail after printing the report if any archived artifact drifts from the expected passing-vs-blocked contract.
+- When consuming archived packaging baselines, `packaging-baseline-report` can read one baseline file, multiple explicit files, or a directory tree of downloaded CI artifacts; add `--json` for aggregate machine-readable output and `--require-contract-ok` when downstream automation should fail after printing the report if any archived artifact drifts from the expected passing-vs-blocked contract. Use `scripts/packaging_report.py` or the installed `resource-hunter-packaging-baseline-report` entrypoint when the caller wants the report flow without routing through the main CLI. For fixed-size CI matrices, prefer `scripts/packaging_gate.py ... --json --require-artifact-count <N>` so missing artifact uploads fail the gate too; `--json` now also emits a `report_type=error` summary when discovery or post-download scanning fails before a normal gate payload can be built.
 - If the user explicitly wants only pan or only torrent, set `--channel pan` or `--channel torrent`
 
 ## References

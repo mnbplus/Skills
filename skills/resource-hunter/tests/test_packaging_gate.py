@@ -5,6 +5,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+import pytest
+
 import resource_hunter.packaging_gate as packaging_gate
 
 
@@ -222,6 +224,78 @@ def test_evaluate_packaging_baseline_gate_accepts_zip_archives(tmp_path):
     ]
 
 
+def test_evaluate_packaging_baseline_gate_records_required_artifact_count(tmp_path):
+    artifact_root = tmp_path / "downloaded-artifacts"
+    _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=True,
+    )
+
+    payload = packaging_gate.evaluate_packaging_baseline_gate(
+        [artifact_root],
+        required_artifact_count=2,
+    )
+
+    assert payload["ok"] is True
+    assert payload["failure_count"] == 0
+    assert payload["expected_artifact_count"] == 2
+    assert payload["actual_artifact_count"] == 2
+
+
+def test_packaging_baseline_gate_main_json_exits_2_on_artifact_count_mismatch(capsys, tmp_path):
+    artifact_root = tmp_path / "downloaded-artifacts"
+    artifact_path = _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+
+    rc = packaging_gate.main(["--json", "--require-artifact-count", "2", str(artifact_root)])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    payload = json.loads(captured.out)
+    assert payload["gate_schema_version"] == packaging_gate.PACKAGING_BASELINE_GATE_SCHEMA_VERSION
+    assert payload["ok"] is False
+    assert payload["failure_count"] == 1
+    assert payload["artifact_path"] == str(artifact_path.resolve())
+    assert payload["expected_artifact_count"] == 2
+    assert payload["actual_artifact_count"] == 1
+    assert (
+        "Packaging baseline gate expected 2 artifact(s) but found 1."
+        in payload["failures"]
+    )
+    assert "Packaging baseline gate expected 2 artifact(s) but found 1." in captured.err
+
+
+def test_packaging_baseline_gate_main_json_emits_error_payload_when_artifacts_missing(capsys, tmp_path):
+    artifact_root = tmp_path / "downloaded-artifacts"
+    artifact_root.mkdir()
+
+    rc = packaging_gate.main(["--json", "--require-artifact-count", "2", str(artifact_root)])
+
+    captured = capsys.readouterr()
+    error = f"No packaging-baseline.json artifacts found under {artifact_root.resolve()}."
+    assert rc == 1
+    assert json.loads(captured.out) == {
+        "gate_schema_version": packaging_gate.PACKAGING_BASELINE_GATE_SCHEMA_VERSION,
+        "report_type": "error",
+        "summary": {},
+        "ok": False,
+        "failure_count": 1,
+        "failures": [error],
+        "error": error,
+        "expected_artifact_count": 2,
+    }
+    assert captured.err.strip() == error
+
+
 def test_packaging_baseline_gate_main_json_exits_2_on_zip_drift(capsys, tmp_path):
     archive_path = tmp_path / "downloaded-artifacts.zip"
     ok_payload_path = _write_packaging_baseline_artifact(
@@ -258,3 +332,377 @@ def test_packaging_baseline_gate_main_json_exits_2_on_zip_drift(capsys, tmp_path
         f"{drift_ref}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
         in captured.err
     )
+
+
+def test_evaluate_packaging_baseline_gate_from_github_run_downloads_artifacts(monkeypatch, tmp_path):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    seen: dict[str, object] = {}
+    ubuntu_artifact = download_dir / "resource-hunter-packaging-baseline-ubuntu-latest-py3.12" / "packaging-baseline.json"
+    windows_artifact = download_dir / "resource-hunter-packaging-baseline-windows-latest-py3.13" / "packaging-baseline.json"
+
+    def fake_run_command(args, *, cwd, timeout=300):
+        seen["args"] = list(args)
+        seen["cwd"] = str(cwd)
+        seen["timeout"] = timeout
+        _write_packaging_baseline_artifact(
+            download_dir,
+            "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+            baseline_contract_ok=True,
+        )
+        _write_packaging_baseline_artifact(
+            download_dir,
+            "resource-hunter-packaging-baseline-windows-latest-py3.13",
+            baseline_contract_ok=True,
+        )
+        return {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": "downloaded",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(packaging_gate, "_run_command", fake_run_command)
+
+    payload = packaging_gate.evaluate_packaging_baseline_gate_from_github_run(
+        "123456",
+        repo="openclaw/resource-hunter",
+        download_dir=download_dir,
+        required_artifact_count=2,
+    )
+
+    assert payload["ok"] is True
+    assert payload["failure_count"] == 0
+    assert payload["expected_artifact_count"] == 2
+    assert payload["actual_artifact_count"] == 2
+    assert payload["download"] == {
+        "provider": "github-actions",
+        "run_id": "123456",
+        "repo": "openclaw/resource-hunter",
+        "download_dir": str(download_dir.resolve()),
+        "download_dir_source": "argument",
+        "download_dir_retained": True,
+        "artifact_names": [],
+        "artifact_patterns": [packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN],
+        "artifact_filter_source": "default",
+        "resolved_artifact_count": 2,
+        "resolved_artifact_paths": [str(ubuntu_artifact.resolve()), str(windows_artifact.resolve())],
+        "resolved_archive_member_count": 0,
+        "resolved_filesystem_artifact_count": 2,
+        "download_command": [
+            "/fake/bin/gh",
+            "run",
+            "download",
+            "123456",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--dir",
+            str(download_dir.resolve()),
+            "--pattern",
+            packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+        ],
+    }
+    assert seen == {
+        "args": [
+            "/fake/bin/gh",
+            "run",
+            "download",
+            "123456",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--dir",
+            str(download_dir.resolve()),
+            "--pattern",
+            packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+        ],
+        "cwd": str(Path.cwd()),
+        "timeout": 300,
+    }
+
+
+def test_evaluate_packaging_baseline_gate_from_github_run_uses_environment_repo_when_repo_omitted(
+    monkeypatch, tmp_path
+):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    seen: dict[str, object] = {}
+
+    def fake_run_command(args, *, cwd, timeout=300):
+        seen["args"] = list(args)
+        _write_packaging_baseline_artifact(
+            download_dir,
+            "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+            baseline_contract_ok=True,
+        )
+        return {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": "downloaded",
+            "stderr": "",
+        }
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "openclaw/resource-hunter")
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(packaging_gate, "_run_command", fake_run_command)
+
+    payload = packaging_gate.evaluate_packaging_baseline_gate_from_github_run(
+        "123456",
+        download_dir=download_dir,
+        required_artifact_count=1,
+    )
+
+    assert payload["download"]["repo"] == "openclaw/resource-hunter"
+    assert payload["download"]["repo_source"] == "environment"
+    assert seen["args"] == [
+        "/fake/bin/gh",
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()),
+        "--pattern",
+        packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+    ]
+
+
+def test_evaluate_packaging_baseline_gate_from_github_run_uses_git_origin_repo_when_repo_omitted(
+    monkeypatch, tmp_path
+):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    seen: dict[str, object] = {}
+
+    def fake_git_run(args, *, cwd, check, capture_output, text, timeout):
+        assert args == ["git", "remote", "get-url", "origin"]
+        assert check is False
+        assert capture_output is True
+        assert text is True
+        assert timeout == 10
+        return packaging_gate.subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="https://github.com/openclaw/resource-hunter.git\n",
+            stderr="",
+        )
+
+    def fake_run_command(args, *, cwd, timeout=300):
+        seen["args"] = list(args)
+        _write_packaging_baseline_artifact(
+            download_dir,
+            "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+            baseline_contract_ok=True,
+        )
+        return {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": "downloaded",
+            "stderr": "",
+        }
+
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(packaging_gate.subprocess, "run", fake_git_run)
+    monkeypatch.setattr(packaging_gate, "_run_command", fake_run_command)
+
+    payload = packaging_gate.evaluate_packaging_baseline_gate_from_github_run(
+        "123456",
+        download_dir=download_dir,
+        required_artifact_count=1,
+    )
+
+    assert payload["download"]["repo"] == "openclaw/resource-hunter"
+    assert payload["download"]["repo_source"] == "git-origin"
+    assert seen["args"] == [
+        "/fake/bin/gh",
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()),
+        "--pattern",
+        packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+    ]
+
+
+def test_packaging_baseline_gate_main_errors_when_gh_download_fails(capsys, monkeypatch):
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(
+        packaging_gate.subprocess,
+        "run",
+        lambda *args, **kwargs: packaging_gate.subprocess.CompletedProcess(args=args[0], returncode=1),
+    )
+    monkeypatch.setattr(
+        packaging_gate,
+        "_run_command",
+        lambda args, *, cwd, timeout=300: {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "artifact download failed",
+        },
+    )
+
+    rc = packaging_gate.main(["--github-run", "987654"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert (
+        captured.err.strip()
+        == "GitHub Actions artifact download failed for run 987654: artifact download failed"
+    )
+
+
+def test_packaging_baseline_gate_main_json_emits_error_payload_when_gh_download_fails(capsys, monkeypatch, tmp_path):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(
+        packaging_gate,
+        "_run_command",
+        lambda args, *, cwd, timeout=300: {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "artifact download failed",
+        },
+    )
+
+    rc = packaging_gate.main(
+        [
+            "--json",
+            "--github-run",
+            "987654",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--download-dir",
+            str(download_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    error = "GitHub Actions artifact download failed for openclaw/resource-hunter run 987654: artifact download failed"
+    assert rc == 1
+    assert json.loads(captured.out) == {
+        "gate_schema_version": packaging_gate.PACKAGING_BASELINE_GATE_SCHEMA_VERSION,
+        "report_type": "error",
+        "summary": {},
+        "ok": False,
+        "failure_count": 1,
+        "failures": [error],
+        "error": error,
+        "download": {
+            "provider": "github-actions",
+            "run_id": "987654",
+            "repo": "openclaw/resource-hunter",
+            "download_dir": str(download_dir.resolve()),
+            "download_dir_source": "argument",
+            "download_dir_retained": True,
+            "artifact_names": [],
+            "artifact_patterns": [packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN],
+            "artifact_filter_source": "default",
+            "download_command": [
+                "/fake/bin/gh",
+                "run",
+                "download",
+                "987654",
+                "--repo",
+                "openclaw/resource-hunter",
+                "--dir",
+                str(download_dir.resolve()),
+                "--pattern",
+                packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+            ],
+            "download_returncode": 1,
+            "download_stderr": "artifact download failed",
+        },
+    }
+    assert captured.err.strip() == error
+
+
+def test_packaging_baseline_gate_main_json_emits_error_payload_when_github_run_has_no_artifacts(
+    capsys, monkeypatch, tmp_path
+):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(
+        packaging_gate,
+        "_run_command",
+        lambda args, *, cwd, timeout=300: {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": "downloaded",
+            "stderr": "",
+        },
+    )
+
+    rc = packaging_gate.main(
+        [
+            "--json",
+            "--github-run",
+            "123456",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--download-dir",
+            str(download_dir),
+            "--require-artifact-count",
+            "2",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    error = f"No packaging-baseline.json artifacts found under {download_dir.resolve()}."
+    assert rc == 1
+    assert json.loads(captured.out) == {
+        "gate_schema_version": packaging_gate.PACKAGING_BASELINE_GATE_SCHEMA_VERSION,
+        "report_type": "error",
+        "summary": {},
+        "ok": False,
+        "failure_count": 1,
+        "failures": [error],
+        "error": error,
+        "expected_artifact_count": 2,
+        "download": {
+            "provider": "github-actions",
+            "run_id": "123456",
+            "repo": "openclaw/resource-hunter",
+            "download_dir": str(download_dir.resolve()),
+            "download_dir_source": "argument",
+            "download_dir_retained": True,
+            "artifact_names": [],
+            "artifact_patterns": [packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN],
+            "artifact_filter_source": "default",
+            "resolved_artifact_count": 0,
+            "resolved_artifact_paths": [],
+            "resolved_archive_member_count": 0,
+            "resolved_filesystem_artifact_count": 0,
+            "download_command": [
+                "/fake/bin/gh",
+                "run",
+                "download",
+                "123456",
+                "--repo",
+                "openclaw/resource-hunter",
+                "--dir",
+                str(download_dir.resolve()),
+                "--pattern",
+                packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+            ],
+        },
+    }
+    assert captured.err.strip() == error
+
+
+def test_packaging_baseline_gate_main_rejects_paths_with_github_run():
+    with pytest.raises(SystemExit) as excinfo:
+        packaging_gate.main(["--github-run", "123456", "artifacts/downloaded-gh-artifacts"])
+
+    assert excinfo.value.code == 2

@@ -1,4 +1,4 @@
-name: resource-hunter-ci
+﻿name: resource-hunter-ci
 
 on:
   push:
@@ -10,6 +10,13 @@ on:
       - "skills/resource-hunter/**"
       - ".github/workflows/resource-hunter-ci.yml"
 
+env:
+  RESOURCE_HUNTER_PROJECT_ROOT: ./skills/resource-hunter
+  RESOURCE_HUNTER_PACKAGING_ARTIFACT_DIR: ./skills/resource-hunter/artifacts/packaging-baseline
+  RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR: ./skills/resource-hunter/artifacts/downloaded-packaging-baseline
+  RESOURCE_HUNTER_PACKAGING_ARTIFACT_PATTERN: resource-hunter-packaging-baseline-*
+  RESOURCE_HUNTER_PACKAGING_EXPECTED_ARTIFACT_COUNT: "6"
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -18,9 +25,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12"]
-    env:
-      RESOURCE_HUNTER_PROJECT_ROOT: ./skills/resource-hunter
-      RESOURCE_HUNTER_PACKAGING_ARTIFACT_DIR: ./skills/resource-hunter/artifacts/packaging-baseline
     steps:
       - uses: actions/checkout@v4
 
@@ -59,8 +63,82 @@ jobs:
           path: ${{ env.RESOURCE_HUNTER_PACKAGING_ARTIFACT_DIR }}
           if-no-files-found: ignore
 
-      - name: Enforce packaging baseline expectations
-        if: steps.packaging_baseline.outcome == 'failure'
+  packaging-baseline-gate:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: python -m pip install --upgrade pip && python -m pip install "./skills/resource-hunter"
+
+      - name: Download packaging baseline artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.RESOURCE_HUNTER_PACKAGING_ARTIFACT_PATTERN }}
+          path: ${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}
+
+      - name: Render downloaded packaging baseline report
+        id: packaging_baseline_report
+        continue-on-error: true
+        shell: bash
         run: |
-          echo "Packaging baseline requirement failed; inspect the uploaded baseline artifacts."
-          exit 1
+          set +e
+          resource-hunter-packaging-baseline-report \
+            --json \
+            --require-contract-ok \
+            "${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}" \
+            > "${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}/packaging-baseline-report.json"
+          status=$?
+          cat "${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}/packaging-baseline-report.json"
+          exit $status
+
+      - name: Evaluate downloaded packaging baseline artifacts
+        id: packaging_baseline_gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          resource-hunter-packaging-baseline-gate \
+            --json \
+            --require-artifact-count "${{ env.RESOURCE_HUNTER_PACKAGING_EXPECTED_ARTIFACT_COUNT }}" \
+            "${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}" \
+            > "${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}/packaging-baseline-gate.json"
+          status=$?
+          cat "${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}/packaging-baseline-gate.json"
+          exit $status
+
+      - name: Upload packaging baseline report summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-hunter-packaging-baseline-report-summary
+          path: ${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}/packaging-baseline-report.json
+          if-no-files-found: ignore
+
+      - name: Upload packaging baseline gate summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-hunter-packaging-baseline-gate-summary
+          path: ${{ env.RESOURCE_HUNTER_DOWNLOADED_PACKAGING_ARTIFACT_DIR }}/packaging-baseline-gate.json
+          if-no-files-found: ignore
+
+      - name: Fail if packaging report or gate drifted
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.packaging_baseline_report.outcome }}" != "success" ]; then
+            echo "::error::packaging-baseline-report detected drift or failed"
+            exit 1
+          fi
+          if [ "${{ steps.packaging_baseline_gate.outcome }}" != "success" ]; then
+            echo "::error::packaging-baseline-gate detected drift or failed"
+            exit 1
+          fi
+

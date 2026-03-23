@@ -6,12 +6,13 @@ import os
 import subprocess
 import sys
 import sysconfig
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from resource_hunter import __version__
-from resource_hunter import packaging_smoke
+from resource_hunter import packaging_gate, packaging_report, packaging_smoke
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,12 +109,18 @@ def _supports_wheel_build() -> bool:
         return False
 
 
-def _write_packaging_baseline_artifact(root: Path, artifact_name: str) -> Path:
+def _write_packaging_baseline_artifact(
+    root: Path,
+    artifact_name: str,
+    *,
+    baseline_contract_ok: bool = True,
+) -> Path:
     artifact_dir = root / artifact_name
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / "packaging-baseline.json"
     blocked_python_name = "python.exe" if os.name == "nt" else "python"
     blocked_python = artifact_dir / "__blocked_python__" / blocked_python_name
+    blocked_warning = "Blocked capture did not report failed_step."
     payload = {
         "schema_version": 1,
         "captured_at": "2026-03-23T00:00:00Z",
@@ -153,33 +160,93 @@ def _write_packaging_baseline_artifact(root: Path, artifact_name: str) -> Path:
             "packaging_python_source": "argument",
             "doctor_packaging_ready": False,
             "packaging_smoke_ok": False,
-            "strategy": "blocked",
-            "strategy_family": "blocked",
-            "reason": "Packaging smoke blocked.",
-            "failed_step": "packaging-status",
+            "strategy": "blocked" if baseline_contract_ok else "prefix-install",
+            "strategy_family": "blocked" if baseline_contract_ok else "usable",
+            "reason": "Packaging smoke blocked." if baseline_contract_ok else "Packaging smoke unexpectedly passed.",
+            "failed_step": "packaging-status" if baseline_contract_ok else None,
             "expected_outcome": {
                 "doctor_packaging_ready": False,
                 "packaging_smoke_ok": False,
                 "failed_step_present": True,
                 "strategy_family_any_of": ["blocked"],
             },
-            "matches_expectation": True,
-            "expectation_drift": [],
+            "matches_expectation": baseline_contract_ok,
+            "expectation_drift": []
+            if baseline_contract_ok
+            else [
+                {
+                    "capture": "blocked",
+                    "field": "failed_step",
+                    "kind": "missing_failed_step",
+                    "expected_present": True,
+                    "actual": None,
+                    "message": blocked_warning,
+                }
+            ],
         },
         "summary": {
             "passing_capture_matches_expectation": True,
-            "blocked_capture_matches_expectation": True,
-            "baseline_contract_ok": True,
+            "blocked_capture_matches_expectation": baseline_contract_ok,
+            "baseline_contract_ok": baseline_contract_ok,
         },
-        "warnings": [],
+        "warnings": [] if baseline_contract_ok else [blocked_warning],
         "requirements": {
             "require_expected_outcomes": True,
-            "ok": True,
-            "failures": [],
+            "ok": baseline_contract_ok,
+            "failures": []
+            if baseline_contract_ok
+            else [f"Packaging baseline requirement failed: {blocked_warning}"],
         },
     }
     artifact_path.write_text(json.dumps(payload), encoding="utf-8")
     return artifact_path
+
+
+def _write_fake_gh_download_command(fake_bin: Path, *, seed_root: Path, invocation_log: Path) -> Path:
+    fake_gh_impl = fake_bin / "fake_gh.py"
+    fake_gh_impl.write_text(
+        "import json\n"
+        "import shutil\n"
+        "import sys\n"
+        "from pathlib import Path\n\n"
+        f"SEED_ROOT = Path(r'''{seed_root}''')\n"
+        f"INVOCATION_LOG = Path(r'''{invocation_log}''')\n\n"
+        "def main() -> int:\n"
+        "    args = sys.argv[1:]\n"
+        "    INVOCATION_LOG.write_text(json.dumps(args), encoding='utf-8')\n"
+        "    if args[:2] != ['run', 'download']:\n"
+        "        print(f'unexpected gh invocation: {args}', file=sys.stderr)\n"
+        "        return 1\n"
+        "    try:\n"
+        "        download_dir = Path(args[args.index('--dir') + 1])\n"
+        "    except (ValueError, IndexError):\n"
+        "        print('--dir is required', file=sys.stderr)\n"
+        "        return 1\n"
+        "    download_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    for child in SEED_ROOT.iterdir():\n"
+        "        target = download_dir / child.name\n"
+        "        if target.exists():\n"
+        "            shutil.rmtree(target)\n"
+        "        shutil.copytree(child, target)\n"
+        "    return 0\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        fake_gh = fake_bin / "gh.cmd"
+        fake_gh.write_text(
+            f'@echo off\r\n"{sys.executable}" "{fake_gh_impl}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            f'#!/bin/sh\n"{sys.executable}" "{fake_gh_impl}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+    return fake_gh
 
 
 def test_find_project_root_walks_up(tmp_path):
@@ -842,6 +909,42 @@ def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
         artifact_root,
         "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
     )
+    gh_seed_root = tmp_path / "github-run-seed"
+    _write_packaging_baseline_artifact(
+        gh_seed_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+    )
+    _write_packaging_baseline_artifact(
+        gh_seed_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.12",
+    )
+    fake_bin = tmp_path / "fake-gh-bin"
+    fake_bin.mkdir()
+    invocation_log = tmp_path / "fake-gh-invocation.json"
+    fake_gh = _write_fake_gh_download_command(fake_bin, seed_root=gh_seed_root, invocation_log=invocation_log)
+    gh_download_dir = tmp_path / "downloaded-gh-artifacts-via-gh"
+    scratch_root = tmp_path / "scratch"
+    ok_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+    )
+    drift_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+    downloads_root = tmp_path / "downloaded-gh-artifact-zips"
+    archive_path = downloads_root / "nested" / "downloaded-gh-artifacts.zip"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "job-a/packaging-baseline.json",
+            ok_path.read_text(encoding="utf-8"),
+        )
+        archive.writestr(
+            "job-b/packaging-baseline.json",
+            drift_path.read_text(encoding="utf-8"),
+        )
 
     if _supports_venv():
         import venv
@@ -860,10 +963,43 @@ def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
         assert console_script.exists(), f"console script not generated: {console_script}"
         console_help_result = _run_command([str(console_script), "--help"], cwd=tmp_path)
         console_version_result = _run_command([str(console_script), "--version"], cwd=tmp_path)
+        report_console_script = _venv_console_script(venv_dir, "resource-hunter-packaging-baseline-report")
+        assert report_console_script.exists(), f"packaging report console script not generated: {report_console_script}"
+        report_help_result = _run_command([str(report_console_script), "--help"], cwd=tmp_path)
+        report_json_result = _run_command([str(report_console_script), "--json", str(artifact_root)], cwd=tmp_path)
+        report_zip_json_result = _run_command(
+            [str(report_console_script), "--json", "--require-contract-ok", str(downloads_root)],
+            cwd=tmp_path,
+        )
         gate_console_script = _venv_console_script(venv_dir, "resource-hunter-packaging-baseline-gate")
         assert gate_console_script.exists(), f"packaging gate console script not generated: {gate_console_script}"
         gate_help_result = _run_command([str(gate_console_script), "--help"], cwd=tmp_path)
-        gate_json_result = _run_command([str(gate_console_script), "--json", str(artifact_root)], cwd=tmp_path)
+        gate_json_result = _run_command(
+            [str(gate_console_script), "--json", "--require-artifact-count", "1", str(artifact_root)],
+            cwd=tmp_path,
+        )
+        gate_zip_json_result = _run_command(
+            [str(gate_console_script), "--json", "--require-artifact-count", "2", str(downloads_root)],
+            cwd=tmp_path,
+        )
+        gate_github_env = _clean_env()
+        gate_github_env["PATH"] = f"{fake_bin}{os.pathsep}{gate_github_env.get('PATH', '')}"
+        gate_github_json_result = _run_command(
+            [
+                str(gate_console_script),
+                "--json",
+                "--github-run",
+                "123456",
+                "--repo",
+                "openclaw/resource-hunter",
+                "--download-dir",
+                str(gh_download_dir),
+                "--require-artifact-count",
+                "2",
+            ],
+            cwd=tmp_path,
+            env=gate_github_env,
+        )
     else:
         install_root = tmp_path / "wheel-install"
         install_result = _run_command(
@@ -878,10 +1014,50 @@ def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
         assert console_script.exists(), f"console script not generated: {console_script}"
         console_help_result = _run_command([str(console_script), "--help"], cwd=tmp_path, env=env)
         console_version_result = _run_command([str(console_script), "--version"], cwd=tmp_path, env=env)
+        report_console_script = _prefix_console_script(install_root, "resource-hunter-packaging-baseline-report")
+        assert report_console_script.exists(), f"packaging report console script not generated: {report_console_script}"
+        report_help_result = _run_command([str(report_console_script), "--help"], cwd=tmp_path, env=env)
+        report_json_result = _run_command(
+            [str(report_console_script), "--json", str(artifact_root)],
+            cwd=tmp_path,
+            env=env,
+        )
+        report_zip_json_result = _run_command(
+            [str(report_console_script), "--json", "--require-contract-ok", str(downloads_root)],
+            cwd=tmp_path,
+            env=env,
+        )
         gate_console_script = _prefix_console_script(install_root, "resource-hunter-packaging-baseline-gate")
         assert gate_console_script.exists(), f"packaging gate console script not generated: {gate_console_script}"
         gate_help_result = _run_command([str(gate_console_script), "--help"], cwd=tmp_path, env=env)
-        gate_json_result = _run_command([str(gate_console_script), "--json", str(artifact_root)], cwd=tmp_path, env=env)
+        gate_json_result = _run_command(
+            [str(gate_console_script), "--json", "--require-artifact-count", "1", str(artifact_root)],
+            cwd=tmp_path,
+            env=env,
+        )
+        gate_zip_json_result = _run_command(
+            [str(gate_console_script), "--json", "--require-artifact-count", "2", str(downloads_root)],
+            cwd=tmp_path,
+            env=env,
+        )
+        gate_github_env = dict(env)
+        gate_github_env["PATH"] = f"{fake_bin}{os.pathsep}{gate_github_env.get('PATH', '')}"
+        gate_github_json_result = _run_command(
+            [
+                str(gate_console_script),
+                "--json",
+                "--github-run",
+                "123456",
+                "--repo",
+                "openclaw/resource-hunter",
+                "--download-dir",
+                str(gh_download_dir),
+                "--require-artifact-count",
+                "2",
+            ],
+            cwd=tmp_path,
+            env=gate_github_env,
+        )
 
     assert help_result.returncode == 0, help_result.stderr or help_result.stdout
     assert "usage:" in help_result.stdout
@@ -895,6 +1071,20 @@ def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
     if console_version_result is not None:
         assert console_version_result.returncode == 0, console_version_result.stderr or console_version_result.stdout
         assert console_version_result.stdout.strip() == f"resource-hunter {__version__}"
+    assert report_help_result.returncode == 0, report_help_result.stderr or report_help_result.stdout
+    assert "usage:" in report_help_result.stdout
+    assert "artifact file(s)" in report_help_result.stdout
+    expected_report_payload = packaging_report.read_packaging_baseline_reports([artifact_root])
+    assert report_json_result.returncode == 0, report_json_result.stderr or report_json_result.stdout
+    assert json.loads(report_json_result.stdout) == expected_report_payload
+    expected_zip_report_payload = packaging_report.read_packaging_baseline_reports([downloads_root])
+    expected_zip_report_failures = packaging_report.packaging_baseline_report_requirement_failures(
+        expected_zip_report_payload
+    )
+    assert report_zip_json_result.returncode == 2, report_zip_json_result.stderr or report_zip_json_result.stdout
+    assert json.loads(report_zip_json_result.stdout) == expected_zip_report_payload
+    for failure in expected_zip_report_failures:
+        assert failure in report_zip_json_result.stderr
     assert gate_help_result.returncode == 0, gate_help_result.stderr or gate_help_result.stdout
     assert "usage:" in gate_help_result.stdout
     assert gate_json_result.returncode == 0, gate_json_result.stderr or gate_json_result.stdout
@@ -910,4 +1100,75 @@ def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
             "baseline_contract_ok": True,
         },
         "artifact_path": str(artifact_path.resolve()),
+        "expected_artifact_count": 1,
+        "actual_artifact_count": 1,
     }
+    drift_ref = f"{archive_path.resolve()}!/job-b/packaging-baseline.json"
+    assert gate_zip_json_result.returncode == 2, gate_zip_json_result.stderr or gate_zip_json_result.stdout
+    assert json.loads(gate_zip_json_result.stdout) == {
+        "gate_schema_version": 1,
+        "ok": False,
+        "failure_count": 1,
+        "failures": [
+            f"{drift_ref}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
+        ],
+        "report_type": "aggregate",
+        "summary": {
+            "artifact_count": 2,
+            "contract_ok_artifact_count": 1,
+            "contract_drift_artifact_count": 1,
+            "requirement_failed_artifact_count": 1,
+            "warning_count": 1,
+            "all_baseline_contracts_ok": False,
+        },
+        "artifacts_with_contract_drift": [drift_ref],
+        "artifacts_with_requirement_failures": [drift_ref],
+        "expected_artifact_count": 2,
+        "actual_artifact_count": 2,
+    }
+    assert (
+        f"{drift_ref}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
+        in gate_zip_json_result.stderr
+    )
+    assert gate_github_json_result.returncode == 0, gate_github_json_result.stderr or gate_github_json_result.stdout
+    assert gate_github_json_result.stderr == ""
+    gate_github_payload = json.loads(gate_github_json_result.stdout)
+    assert gate_github_payload == packaging_gate.build_packaging_baseline_gate_payload(
+        packaging_report.read_packaging_baseline_reports([gh_download_dir]),
+        required_artifact_count=2,
+        download_payload={
+            "provider": "github-actions",
+            "run_id": "123456",
+            "repo": "openclaw/resource-hunter",
+            "download_dir": str(gh_download_dir.resolve()),
+            "download_dir_source": "argument",
+            "download_dir_retained": True,
+            "artifact_names": [],
+            "artifact_patterns": [packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN],
+            "artifact_filter_source": "default",
+            "download_command": gate_github_payload["download"]["download_command"],
+        },
+    )
+    assert [part.lower() if isinstance(part, str) else part for part in gate_github_payload["download"]["download_command"]] == [
+        str(fake_gh.resolve()).lower(),
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(gh_download_dir.resolve()).lower(),
+        "--pattern",
+        packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+    ]
+    assert json.loads(invocation_log.read_text(encoding="utf-8")) == [
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(gh_download_dir.resolve()),
+        "--pattern",
+        packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+    ]

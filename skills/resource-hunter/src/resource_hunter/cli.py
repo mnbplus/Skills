@@ -172,6 +172,17 @@ def _artifact_value_text(value: Any) -> str:
     return str(value)
 
 
+def _download_repo_text(download: dict[str, Any]) -> str:
+    repo = download.get("repo")
+    if repo is None:
+        return "current gh context"
+    repo_label = str(repo)
+    repo_source = download.get("repo_source")
+    if repo_source:
+        repo_label = f"{repo_label} ({repo_source})"
+    return repo_label
+
+
 def _expected_strategy_families_text(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         rendered = ", ".join(str(item) for item in value if item is not None and str(item))
@@ -293,6 +304,7 @@ def _format_packaging_baseline_text(report_payload: dict[str, Any]) -> str:
     requirements = (
         report_payload.get("requirements") if isinstance(report_payload.get("requirements"), dict) else {}
     )
+    download = report_payload.get("download") if isinstance(report_payload.get("download"), dict) else {}
     lines = [
         "Resource Hunter packaging baseline report",
         f"artifact: {report_payload.get('artifact_path') or 'unknown'}",
@@ -306,6 +318,14 @@ def _format_packaging_baseline_text(report_payload: dict[str, Any]) -> str:
     requested_project_root = report_payload.get("requested_project_root")
     if requested_project_root is not None:
         lines.append(f"requested_project_root: {requested_project_root}")
+    if download.get("provider") == "github-actions":
+        lines.extend(
+            [
+                f"github_run: {download.get('run_id') or 'unknown'}",
+                f"download_repo: {_download_repo_text(download)}",
+                f"download_dir: {download.get('download_dir') or 'unknown'}",
+            ]
+        )
     lines.extend(
         [
             "",
@@ -349,6 +369,7 @@ def _format_packaging_baseline_text(report_payload: dict[str, Any]) -> str:
 
 def _format_packaging_baseline_aggregate_text(report_payload: dict[str, Any]) -> str:
     summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), dict) else {}
+    download = report_payload.get("download") if isinstance(report_payload.get("download"), dict) else {}
     lines = [
         "Resource Hunter packaging baseline aggregate report",
         f"artifact_count: {summary.get('artifact_count') or 0}",
@@ -364,6 +385,14 @@ def _format_packaging_baseline_aggregate_text(report_payload: dict[str, Any]) ->
             f"{_artifact_value_text(summary.get('all_baseline_contracts_ok'))}"
         ),
     ]
+    if download.get("provider") == "github-actions":
+        lines.extend(
+            [
+                f"github_run: {download.get('run_id') or 'unknown'}",
+                f"download_repo: {_download_repo_text(download)}",
+                f"download_dir: {download.get('download_dir') or 'unknown'}",
+            ]
+        )
     warnings = report_payload.get("warnings")
     if isinstance(warnings, list) and warnings:
         for index, warning in enumerate(warnings, start=1):
@@ -1109,7 +1138,30 @@ def _packaging_baseline(engine: ResourceHunterEngine, args: argparse.Namespace) 
 
 
 def _packaging_baseline_report(args: argparse.Namespace) -> int:
-    report_payload = packaging_report.read_packaging_baseline_reports(getattr(args, "paths", None))
+    try:
+        if getattr(args, "github_run", None):
+            report_payload = packaging_report.read_packaging_baseline_reports_from_github_run(
+                args.github_run,
+                repo=args.repo,
+                artifact_names=args.artifact_names,
+                artifact_patterns=args.artifact_patterns,
+                download_dir=args.download_dir,
+                keep_download_dir=args.keep_download_dir,
+            )
+        else:
+            report_payload = packaging_report.read_packaging_baseline_reports(getattr(args, "paths", None))
+    except ResourceHunterError as exc:
+        if getattr(args, "json", False):
+            print(
+                dump_json(
+                    packaging_report.build_packaging_baseline_report_error_payload(
+                        str(exc),
+                        download_payload=getattr(exc, "download_payload", None),
+                    )
+                )
+            )
+        print(str(exc), file=sys.stderr)
+        return 1
     if getattr(args, "json", False):
         print(dump_json(report_payload))
     else:
@@ -1420,7 +1472,7 @@ def build_parser() -> argparse.ArgumentParser:
         "paths",
         nargs="*",
         help=(
-            "artifact file(s), .zip archive(s), or directories to scan recursively for packaging-baseline.json; "
+            "artifact file(s), .zip archive(s), or directories to scan recursively for packaging-baseline.json and nested .zip archives; "
             "defaults to artifacts/packaging-baseline/packaging-baseline.json"
         ),
     )
@@ -1433,6 +1485,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-contract-ok",
         action="store_true",
         help="exit with code 2 after printing the report when any artifact shows packaging-baseline contract drift",
+    )
+    p_packaging_baseline_report.add_argument(
+        "--github-run",
+        help=(
+            "download packaging-baseline artifacts from a GitHub Actions run with `gh run download` before reporting; "
+            "defaults to the resource-hunter-packaging-baseline-* artifact pattern"
+        ),
+    )
+    p_packaging_baseline_report.add_argument(
+        "--repo",
+        help=(
+            "repository passed through to `gh run download --repo`; defaults to GITHUB_REPOSITORY, "
+            "then the git origin remote, then the current gh repository context"
+        ),
+    )
+    p_packaging_baseline_report.add_argument(
+        "--artifact-name",
+        action="append",
+        dest="artifact_names",
+        help="artifact name to download from --github-run; may be passed multiple times",
+    )
+    p_packaging_baseline_report.add_argument(
+        "--artifact-pattern",
+        action="append",
+        dest="artifact_patterns",
+        help="artifact glob pattern to download from --github-run; may be passed multiple times",
+    )
+    p_packaging_baseline_report.add_argument(
+        "--download-dir",
+        help="directory passed to `gh run download --dir`; defaults to a temporary directory when --github-run is used",
+    )
+    p_packaging_baseline_report.add_argument(
+        "--keep-download-dir",
+        action="store_true",
+        help="retain the temporary download directory created for --github-run reporting",
     )
 
     p_video = sub.add_parser("video", help="Video workflow powered by yt-dlp")
@@ -1476,6 +1563,16 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "packaging-baseline-report":
+        if args.github_run and args.paths:
+            parser.error("paths cannot be combined with --github-run")
+        if not args.github_run and (
+            args.repo or args.artifact_names or args.artifact_patterns or args.download_dir or args.keep_download_dir
+        ):
+            parser.error(
+                "--repo, --artifact-name, --artifact-pattern, --download-dir, and --keep-download-dir require --github-run"
+            )
 
     try:
         if args.command == "packaging-smoke":

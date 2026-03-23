@@ -5,7 +5,10 @@ import sys
 import zipfile
 from pathlib import Path
 
+import pytest
+
 import resource_hunter.cli as cli
+import resource_hunter.packaging_gate as packaging_gate
 
 
 def _write_packaging_baseline_artifact(
@@ -193,6 +196,37 @@ def test_cli_packaging_baseline_report_zip_archive_aggregates_json(capsys, tmp_p
     ]
 
 
+def test_cli_packaging_baseline_report_directory_discovers_nested_zip_archives(capsys, tmp_path):
+    scratch_root = tmp_path / "scratch"
+    ok_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    drift_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+    downloads_root = tmp_path / "downloaded-zips"
+    archive_path = _write_packaging_baseline_archive(
+        downloads_root / "nested" / "downloaded-artifacts.zip",
+        {
+            "job-a/packaging-baseline.json": json.loads(ok_path.read_text(encoding="utf-8")),
+            "job-b/packaging-baseline.json": json.loads(drift_path.read_text(encoding="utf-8")),
+        },
+    )
+
+    rc = cli.main(["packaging-baseline-report", "--json", str(downloads_root)])
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["report_type"] == "aggregate"
+    assert report["artifacts_with_contract_drift"] == [
+        f"{archive_path.resolve()}!/job-b/packaging-baseline.json"
+    ]
+
+
 def test_cli_packaging_baseline_report_directory_without_artifacts_errors(capsys, tmp_path):
     empty_dir = tmp_path / "downloaded-artifacts"
     empty_dir.mkdir()
@@ -203,3 +237,230 @@ def test_cli_packaging_baseline_report_directory_without_artifacts_errors(capsys
     assert rc == 1
     assert "No packaging-baseline.json artifacts found under" in captured.err
     assert str(empty_dir.resolve()) in captured.err
+
+
+def test_cli_packaging_baseline_report_downloads_github_run_artifacts(capsys, monkeypatch, tmp_path):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    seen: dict[str, object] = {}
+    ubuntu_artifact = download_dir / "resource-hunter-packaging-baseline-ubuntu-latest-py3.12" / "packaging-baseline.json"
+    windows_artifact = download_dir / "resource-hunter-packaging-baseline-windows-latest-py3.13" / "packaging-baseline.json"
+
+    def fake_run_command(args, *, cwd, timeout=300):
+        seen["args"] = list(args)
+        seen["cwd"] = str(cwd)
+        seen["timeout"] = timeout
+        _write_packaging_baseline_artifact(
+            download_dir,
+            "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+            baseline_contract_ok=True,
+        )
+        _write_packaging_baseline_artifact(
+            download_dir,
+            "resource-hunter-packaging-baseline-windows-latest-py3.13",
+            baseline_contract_ok=False,
+        )
+        return {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": "downloaded",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(packaging_gate, "_run_command", fake_run_command)
+
+    rc = cli.main(
+        [
+            "packaging-baseline-report",
+            "--json",
+            "--github-run",
+            "123456",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--download-dir",
+            str(download_dir),
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["report_type"] == "aggregate"
+    assert report["summary"] == {
+        "artifact_count": 2,
+        "contract_ok_artifact_count": 1,
+        "contract_drift_artifact_count": 1,
+        "requirement_failed_artifact_count": 1,
+        "warning_count": 1,
+        "all_baseline_contracts_ok": False,
+    }
+    assert report["download"] == {
+        "provider": "github-actions",
+        "run_id": "123456",
+        "repo": "openclaw/resource-hunter",
+        "download_dir": str(download_dir.resolve()),
+        "download_dir_source": "argument",
+        "download_dir_retained": True,
+        "artifact_names": [],
+        "artifact_patterns": [packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN],
+        "artifact_filter_source": "default",
+        "resolved_artifact_count": 2,
+        "resolved_artifact_paths": [str(ubuntu_artifact.resolve()), str(windows_artifact.resolve())],
+        "resolved_archive_member_count": 0,
+        "resolved_filesystem_artifact_count": 2,
+        "download_command": [
+            "/fake/bin/gh",
+            "run",
+            "download",
+            "123456",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--dir",
+            str(download_dir.resolve()),
+            "--pattern",
+            packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+        ],
+    }
+    assert seen == {
+        "args": [
+            "/fake/bin/gh",
+            "run",
+            "download",
+            "123456",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--dir",
+            str(download_dir.resolve()),
+            "--pattern",
+            packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+        ],
+        "cwd": str(Path.cwd()),
+        "timeout": 300,
+    }
+
+
+def test_cli_packaging_baseline_report_uses_environment_repo_when_repo_omitted(capsys, monkeypatch, tmp_path):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+
+    def fake_run_command(args, *, cwd, timeout=300):
+        _write_packaging_baseline_artifact(
+            download_dir,
+            "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+            baseline_contract_ok=True,
+        )
+        return {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": "downloaded",
+            "stderr": "",
+        }
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "openclaw/resource-hunter")
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(packaging_gate, "_run_command", fake_run_command)
+
+    rc = cli.main(
+        [
+            "packaging-baseline-report",
+            "--json",
+            "--github-run",
+            "123456",
+            "--download-dir",
+            str(download_dir),
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["download"]["repo"] == "openclaw/resource-hunter"
+    assert report["download"]["repo_source"] == "environment"
+    assert report["download"]["download_command"] == [
+        "/fake/bin/gh",
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str(download_dir.resolve()),
+        "--pattern",
+        packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+    ]
+
+
+def test_cli_packaging_baseline_report_json_emits_error_payload_when_github_run_has_no_artifacts(
+    capsys, monkeypatch, tmp_path
+):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(
+        packaging_gate,
+        "_run_command",
+        lambda args, *, cwd, timeout=300: {
+            "command": list(args),
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": "downloaded",
+            "stderr": "",
+        },
+    )
+
+    rc = cli.main(
+        [
+            "packaging-baseline-report",
+            "--json",
+            "--github-run",
+            "123456",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--download-dir",
+            str(download_dir),
+        ]
+    )
+
+    error = f"No packaging-baseline.json artifacts found under {download_dir.resolve()}."
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert json.loads(captured.out) == {
+        "report_schema_version": 1,
+        "report_type": "error",
+        "summary": {},
+        "warnings": [],
+        "error": error,
+        "download": {
+            "provider": "github-actions",
+            "run_id": "123456",
+            "repo": "openclaw/resource-hunter",
+            "download_dir": str(download_dir.resolve()),
+            "download_dir_source": "argument",
+            "download_dir_retained": True,
+            "artifact_names": [],
+            "artifact_patterns": [packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN],
+            "artifact_filter_source": "default",
+            "resolved_artifact_count": 0,
+            "resolved_artifact_paths": [],
+            "resolved_archive_member_count": 0,
+            "resolved_filesystem_artifact_count": 0,
+            "download_command": [
+                "/fake/bin/gh",
+                "run",
+                "download",
+                "123456",
+                "--repo",
+                "openclaw/resource-hunter",
+                "--dir",
+                str(download_dir.resolve()),
+                "--pattern",
+                packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+            ],
+        },
+    }
+    assert captured.err.strip() == error
+
+
+def test_cli_packaging_baseline_report_rejects_paths_with_github_run():
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["packaging-baseline-report", "--github-run", "123456", "artifacts/downloaded-gh-artifacts"])
+
+    assert excinfo.value.code == 2

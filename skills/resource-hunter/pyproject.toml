@@ -18,6 +18,7 @@ dev = ["build>=1.2.2", "pytest>=8.2", "ruff>=0.6.9"]
 
 [project.scripts]
 resource-hunter = "resource_hunter.cli:main"
+resource-hunter-packaging-baseline-report = "resource_hunter.packaging_report:main"
 resource-hunter-packaging-baseline-gate = "resource_hunter.packaging_gate:main"
 
 [tool.setuptools]

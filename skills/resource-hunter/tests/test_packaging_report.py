@@ -209,6 +209,24 @@ def test_resolve_packaging_baseline_artifact_paths_expands_zip_archives(tmp_path
     ]
 
 
+def test_resolve_packaging_baseline_artifact_paths_expands_zip_archives_under_directories(tmp_path):
+    downloads_root = tmp_path / "downloaded-gh-artifact-zips"
+    archive_path = _write_baseline_archive(
+        downloads_root / "nested" / "downloaded-gh-artifacts.zip",
+        {
+            "job-a/packaging-baseline.json": _baseline_payload(tmp_path / "job-a"),
+            "job-b/nested/packaging-baseline.json": _baseline_payload(tmp_path / "job-b"),
+        },
+    )
+
+    resolved = resolve_packaging_baseline_artifact_paths([downloads_root])
+
+    assert resolved == [
+        f"{archive_path.resolve()}!/job-a/packaging-baseline.json",
+        f"{archive_path.resolve()}!/job-b/nested/packaging-baseline.json",
+    ]
+
+
 def test_read_packaging_baseline_report_reads_explicit_zip_member(tmp_path):
     artifact_root = tmp_path / "downloaded-gh-artifacts"
     nested_project_root = tmp_path / "job-b"

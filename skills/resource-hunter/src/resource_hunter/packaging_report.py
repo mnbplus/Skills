@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -14,6 +16,12 @@ from .errors import ResourceHunterError
 PACKAGING_BASELINE_REPORT_SCHEMA_VERSION = 1
 DEFAULT_PACKAGING_BASELINE_ARTIFACT = Path("artifacts") / "packaging-baseline" / "packaging-baseline.json"
 _PACKAGING_BASELINE_ARTIFACT_NAME = DEFAULT_PACKAGING_BASELINE_ARTIFACT.name
+
+
+class PackagingBaselineReportError(ResourceHunterError):
+    def __init__(self, message: str, *, download_payload: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.download_payload = _copy_mapping(download_payload)
 
 
 @dataclass(frozen=True)
@@ -34,6 +42,12 @@ def _artifact_display_path(path: str | Path, *, zip_member: str | None = None) -
         return str(resolved_path)
     normalized_member = zip_member.replace("\\", "/").lstrip("/")
     return f"{resolved_path}!/{normalized_member}"
+
+
+def _copy_mapping(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return dict(value)
 
 
 def _split_archive_member_path(path: str | Path) -> tuple[Path, str] | None:
@@ -139,7 +153,26 @@ def _coerce_artifact_ref(path: str | Path) -> _ArtifactRef:
     return _ArtifactRef(display_path=display_path, filesystem_path=Path(path).resolve())
 
 
-def _resolve_packaging_baseline_artifact_refs(raw_paths: Sequence[str | Path] | None = None) -> list[_ArtifactRef]:
+def _directory_artifact_refs(directory_path: str | Path) -> list[_ArtifactRef]:
+    resolved_directory = Path(directory_path).resolve()
+    matches = [
+        _ArtifactRef(display_path=_artifact_display_path(path), filesystem_path=path.resolve())
+        for path in resolved_directory.rglob(_PACKAGING_BASELINE_ARTIFACT_NAME)
+        if path.is_file()
+    ]
+    archive_paths = sorted(
+        path.resolve()
+        for path in resolved_directory.rglob("*")
+        if path.is_file() and path.suffix.lower() == ".zip"
+    )
+    for archive_path in archive_paths:
+        matches.extend(_zip_artifact_refs(archive_path))
+    return sorted(matches, key=_artifact_sort_key)
+
+
+def _resolve_packaging_baseline_artifact_refs(
+    raw_paths: Sequence[str | Path] | None = None, *, allow_empty: bool = False
+) -> list[_ArtifactRef]:
     requested_paths = list(raw_paths or [])
     if not requested_paths:
         requested_paths = [DEFAULT_PACKAGING_BASELINE_ARTIFACT]
@@ -151,14 +184,7 @@ def _resolve_packaging_baseline_artifact_refs(raw_paths: Sequence[str | Path] | 
     for raw_path in requested_paths:
         candidate = Path(raw_path).resolve()
         if candidate.is_dir():
-            matches = sorted(
-                (
-                    _ArtifactRef(display_path=_artifact_display_path(path), filesystem_path=path.resolve())
-                    for path in candidate.rglob(_PACKAGING_BASELINE_ARTIFACT_NAME)
-                    if path.is_file()
-                ),
-                key=_artifact_sort_key,
-            )
+            matches = _directory_artifact_refs(candidate)
             if not matches:
                 empty_directories.append(candidate)
                 continue
@@ -187,6 +213,8 @@ def _resolve_packaging_baseline_artifact_refs(raw_paths: Sequence[str | Path] | 
         seen.add(key)
         artifact_refs.append(_ArtifactRef(display_path=_artifact_display_path(candidate), filesystem_path=candidate))
 
+    if allow_empty and not artifact_refs and (empty_directories or empty_archives):
+        return []
     if empty_directories:
         directories = ", ".join(str(path) for path in empty_directories)
         raise ResourceHunterError(f"No packaging-baseline.json artifacts found under {directories}.")
@@ -318,6 +346,30 @@ def resolve_packaging_baseline_artifact_paths(raw_paths: Sequence[str | Path] | 
     ]
 
 
+def _resolved_download_artifact_paths(download_payload: Mapping[str, Any]) -> list[str | Path]:
+    download_dir = download_payload.get("download_dir")
+    if download_dir is None:
+        return []
+    artifact_refs = _resolve_packaging_baseline_artifact_refs([str(download_dir)], allow_empty=True)
+    return [
+        artifact_ref.display_path if artifact_ref.zip_member is not None else artifact_ref.filesystem_path
+        for artifact_ref in artifact_refs
+    ]
+
+
+def _attach_download_artifact_resolution(
+    download_payload: Mapping[str, Any], artifact_paths: Sequence[str | Path]
+) -> dict[str, Any]:
+    payload = _copy_mapping(download_payload)
+    resolved_paths = [str(artifact_path) for artifact_path in artifact_paths]
+    archive_member_count = sum(1 for artifact_path in resolved_paths if "!/" in artifact_path)
+    payload["resolved_artifact_count"] = len(resolved_paths)
+    payload["resolved_artifact_paths"] = resolved_paths
+    payload["resolved_archive_member_count"] = archive_member_count
+    payload["resolved_filesystem_artifact_count"] = len(resolved_paths) - archive_member_count
+    return payload
+
+
 def build_packaging_baseline_aggregate_report(report_payloads: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     artifact_reports = [dict(report_payload) for report_payload in report_payloads]
     contract_ok_artifact_count = 0
@@ -415,6 +467,112 @@ def read_packaging_baseline_reports(paths: Sequence[str | Path] | None = None) -
     return build_packaging_baseline_aggregate_report(report_payloads)
 
 
+def attach_packaging_baseline_download_payload(
+    report_payload: Mapping[str, Any], *, download_payload: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    payload = dict(report_payload)
+    if download_payload is not None:
+        payload["download"] = _copy_mapping(download_payload)
+    return payload
+
+
+def build_packaging_baseline_report_error_payload(
+    error: str, *, download_payload: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "report_schema_version": PACKAGING_BASELINE_REPORT_SCHEMA_VERSION,
+        "report_type": "error",
+        "summary": {},
+        "warnings": [],
+        "error": error,
+    }
+    if download_payload is not None:
+        payload["download"] = _copy_mapping(download_payload)
+    return payload
+
+
+def _evaluate_downloaded_packaging_baseline_reports(download_payload: Mapping[str, Any]) -> dict[str, Any]:
+    artifact_paths = _resolved_download_artifact_paths(download_payload)
+    download_payload = _attach_download_artifact_resolution(download_payload, artifact_paths)
+    if not artifact_paths:
+        raise PackagingBaselineReportError(
+            f"No packaging-baseline.json artifacts found under {download_payload['download_dir']}.",
+            download_payload=download_payload,
+        )
+    try:
+        report_payload = read_packaging_baseline_reports(artifact_paths)
+    except ResourceHunterError as exc:
+        raise PackagingBaselineReportError(str(exc), download_payload=download_payload) from exc
+    return attach_packaging_baseline_download_payload(report_payload, download_payload=download_payload)
+
+
+def read_packaging_baseline_reports_from_github_run(
+    run_id: str,
+    *,
+    repo: str | None = None,
+    artifact_names: Sequence[str] | None = None,
+    artifact_patterns: Sequence[str] | None = None,
+    download_dir: str | Path | None = None,
+    keep_download_dir: bool = False,
+) -> dict[str, Any]:
+    from . import packaging_gate
+
+    if download_dir is not None:
+        try:
+            download_payload = packaging_gate._download_packaging_baseline_github_run(
+                run_id,
+                repo=repo,
+                artifact_names=artifact_names,
+                artifact_patterns=artifact_patterns,
+                download_dir=download_dir,
+                download_dir_source="argument",
+                download_dir_retained=True,
+            )
+        except ResourceHunterError as exc:
+            raise PackagingBaselineReportError(
+                str(exc),
+                download_payload=getattr(exc, "download_payload", None),
+            ) from exc
+        return _evaluate_downloaded_packaging_baseline_reports(download_payload)
+
+    if keep_download_dir:
+        retained_dir = Path(tempfile.mkdtemp(prefix="resource-hunter-gh-run-download-"))
+        try:
+            download_payload = packaging_gate._download_packaging_baseline_github_run(
+                run_id,
+                repo=repo,
+                artifact_names=artifact_names,
+                artifact_patterns=artifact_patterns,
+                download_dir=retained_dir,
+                download_dir_source="temporary",
+                download_dir_retained=True,
+            )
+        except ResourceHunterError as exc:
+            raise PackagingBaselineReportError(
+                str(exc),
+                download_payload=getattr(exc, "download_payload", None),
+            ) from exc
+        return _evaluate_downloaded_packaging_baseline_reports(download_payload)
+
+    with tempfile.TemporaryDirectory(prefix="resource-hunter-gh-run-download-") as temp_dir:
+        try:
+            download_payload = packaging_gate._download_packaging_baseline_github_run(
+                run_id,
+                repo=repo,
+                artifact_names=artifact_names,
+                artifact_patterns=artifact_patterns,
+                download_dir=temp_dir,
+                download_dir_source="temporary",
+                download_dir_retained=False,
+            )
+        except ResourceHunterError as exc:
+            raise PackagingBaselineReportError(
+                str(exc),
+                download_payload=getattr(exc, "download_payload", None),
+            ) from exc
+        return _evaluate_downloaded_packaging_baseline_reports(download_payload)
+
+
 def packaging_baseline_report_requirement_failures(report_payload: Mapping[str, Any]) -> list[str]:
     report_type = report_payload.get("report_type")
     if report_type == "aggregate":
@@ -442,14 +600,30 @@ def packaging_baseline_report_requirement_failures(report_payload: Mapping[str, 
     return [f"{artifact_path}: Packaging baseline contract drift detected."]
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    from .cli import main as cli_main
+
+    forwarded_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    return cli_main(["packaging-baseline-report", *forwarded_argv])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = [
     "DEFAULT_PACKAGING_BASELINE_ARTIFACT",
     "PACKAGING_BASELINE_REPORT_SCHEMA_VERSION",
+    "PackagingBaselineReportError",
+    "attach_packaging_baseline_download_payload",
+    "build_packaging_baseline_report_error_payload",
     "build_packaging_baseline_aggregate_report",
     "build_packaging_baseline_report",
     "load_packaging_baseline_payload",
+    "main",
     "packaging_baseline_report_requirement_failures",
     "read_packaging_baseline_report",
     "read_packaging_baseline_reports",
+    "read_packaging_baseline_reports_from_github_run",
     "resolve_packaging_baseline_artifact_paths",
 ]
