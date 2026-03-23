@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 
 from resource_hunter.cache import ResourceCache
 from resource_hunter.video_core import VideoManager

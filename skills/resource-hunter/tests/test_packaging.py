@@ -1,0 +1,809 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import sysconfig
+from pathlib import Path
+
+import pytest
+
+from resource_hunter import __version__
+from resource_hunter import packaging_smoke
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+
+
+def _clean_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    return env
+
+
+def _run_command(args: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=str(cwd),
+        env=env or _clean_env(),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+
+def _venv_python(venv_dir: Path) -> Path:
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _venv_console_script(venv_dir: Path, script_name: str) -> Path:
+    scripts_dir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+    candidates = [scripts_dir / script_name]
+    if os.name == "nt":
+        candidates.insert(0, scripts_dir / f"{script_name}.exe")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _prefix_paths(prefix_dir: Path) -> tuple[Path, list[Path]]:
+    vars_map = {
+        "base": str(prefix_dir),
+        "platbase": str(prefix_dir),
+        "installed_base": str(prefix_dir),
+        "installed_platbase": str(prefix_dir),
+    }
+    scripts_dir = Path(sysconfig.get_path("scripts", vars=vars_map))
+    site_paths: list[Path] = []
+    for key in ("purelib", "platlib"):
+        site_path = Path(sysconfig.get_path(key, vars=vars_map))
+        if site_path not in site_paths:
+            site_paths.append(site_path)
+    return scripts_dir, site_paths
+
+
+def _prefix_console_script(prefix_dir: Path, script_name: str) -> Path:
+    scripts_dir, _ = _prefix_paths(prefix_dir)
+    candidates = [scripts_dir / script_name]
+    if os.name == "nt":
+        candidates.insert(0, scripts_dir / f"{script_name}.exe")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _prefix_env(prefix_dir: Path) -> dict[str, str]:
+    env = _clean_env()
+    _, site_paths = _prefix_paths(prefix_dir)
+    env["PYTHONPATH"] = os.pathsep.join(str(path) for path in site_paths)
+    return env
+
+
+def _supports_venv() -> bool:
+    return importlib.util.find_spec("venv") is not None
+
+
+def _supports_pip() -> bool:
+    return importlib.util.find_spec("pip") is not None
+
+
+def _supports_wheel_build() -> bool:
+    try:
+        return (
+            _supports_pip()
+            and importlib.util.find_spec("setuptools.build_meta") is not None
+            and importlib.util.find_spec("wheel") is not None
+        )
+    except ModuleNotFoundError:
+        return False
+
+
+def test_find_project_root_walks_up(tmp_path):
+    project_root = tmp_path / "repo"
+    nested = project_root / "scripts" / "nested"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+    nested.mkdir(parents=True)
+
+    assert packaging_smoke.find_project_root(nested) == project_root
+
+
+def test_run_packaging_smoke_reports_missing_project_root(tmp_path):
+    payload = packaging_smoke.run_packaging_smoke(project_root=tmp_path)
+
+    assert payload["ok"] is False
+    assert payload["packaging_python"] == sys.executable
+    assert payload["packaging_python_source"] == "current"
+    assert payload["project_root"] is None
+    assert payload["project_root_source"] == "argument"
+    assert payload["requested_project_root"] == str(tmp_path.resolve())
+    assert payload["packaging"]["project_root"] is None
+    assert payload["packaging"]["project_root_source"] == "argument"
+    assert payload["packaging"]["requested_project_root"] == str(tmp_path.resolve())
+    assert payload["steps"] == []
+    assert "project root" in payload["reason"].lower()
+
+
+def test_run_packaging_smoke_short_circuits_on_packaging_blockers(monkeypatch, tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+    monkeypatch.setattr(
+        packaging_smoke,
+        "packaging_status",
+        lambda python_executable=None: {
+            "pip": True,
+            "venv": False,
+            "setuptools_build_meta": False,
+            "wheel": False,
+            "wheel_build_ready": False,
+            "python_module_smoke_ready": False,
+            "console_script_smoke_ready": False,
+            "full_packaging_smoke_ready": False,
+            "blockers": ["setuptools.build_meta", "wheel"],
+            "optional_gaps": ["venv"],
+            "console_script_strategy": "blocked",
+        },
+    )
+
+    payload = packaging_smoke.run_packaging_smoke(project_root=project_root)
+
+    assert payload["ok"] is False
+    assert payload["strategy"] == "blocked"
+    assert payload["strategy_family"] == "blocked"
+    assert payload["failed_step"] == "packaging-gate"
+    assert payload["steps"] == []
+    assert payload["project_root_source"] == "argument"
+    assert payload["requested_project_root"] == str(project_root)
+    assert payload["packaging"]["project_root"] == str(project_root)
+    assert payload["packaging"]["project_root_source"] == "argument"
+    assert payload["packaging"]["requested_project_root"] == str(project_root)
+    assert payload["packaging"]["blockers"] == ["setuptools.build_meta", "wheel"]
+    assert "setuptools.build_meta" in payload["reason"]
+    assert "wheel" in payload["reason"]
+
+
+def test_annotate_project_packaging_status_records_project_root_without_bootstrap_metadata(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+
+    annotated = packaging_smoke.annotate_project_packaging_status(
+        {
+            "pip": True,
+            "venv": False,
+            "setuptools_build_meta": False,
+            "wheel": False,
+            "wheel_build_ready": False,
+            "python_module_smoke_ready": False,
+            "console_script_smoke_ready": False,
+            "full_packaging_smoke_ready": False,
+            "blockers": ["setuptools.build_meta", "wheel"],
+            "optional_gaps": ["venv"],
+            "console_script_strategy": "blocked",
+        },
+        project_root=project_root,
+        include_bootstrap_metadata=False,
+    )
+
+    assert annotated["project_root"] == str(project_root)
+    assert annotated["project_root_source"] == "argument"
+    assert annotated["requested_project_root"] == str(project_root)
+    assert "bootstrap_build_deps_ready" not in annotated
+    assert "bootstrap_build_requirements" not in annotated
+    assert "bootstrap_console_script_strategy" not in annotated
+    assert "packaging_smoke_ready_with_bootstrap" not in annotated
+
+
+def test_annotate_project_packaging_status_distinguishes_requested_and_resolved_project_root(tmp_path):
+    project_root = tmp_path / "repo"
+    nested = project_root / "ops" / "workspace"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+    nested.mkdir(parents=True)
+
+    annotated = packaging_smoke.annotate_project_packaging_status(
+        {
+            "pip": True,
+            "venv": True,
+            "setuptools_build_meta": True,
+            "wheel": True,
+            "wheel_build_ready": True,
+            "python_module_smoke_ready": True,
+            "console_script_smoke_ready": True,
+            "full_packaging_smoke_ready": True,
+            "blockers": [],
+            "optional_gaps": [],
+            "console_script_strategy": "venv",
+        },
+        project_root=nested,
+        include_bootstrap_metadata=False,
+    )
+
+    assert annotated["requested_project_root"] == str(nested)
+    assert annotated["project_root"] == str(project_root)
+    assert annotated["project_root_source"] == "argument"
+
+
+def test_annotate_project_packaging_status_marks_discovered_root_source_when_project_root_omitted(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+
+    annotated = packaging_smoke.annotate_project_packaging_status(
+        {
+            "pip": True,
+            "venv": True,
+            "setuptools_build_meta": True,
+            "wheel": True,
+            "wheel_build_ready": True,
+            "python_module_smoke_ready": True,
+            "console_script_smoke_ready": True,
+            "full_packaging_smoke_ready": True,
+            "blockers": [],
+            "optional_gaps": [],
+            "console_script_strategy": "venv",
+        },
+        resolved_project_root=project_root,
+        include_bootstrap_metadata=False,
+    )
+
+    assert annotated["project_root"] == str(project_root)
+    assert annotated["project_root_source"] == "discovered"
+    assert "requested_project_root" not in annotated
+
+
+def test_run_packaging_smoke_bootstraps_missing_build_deps(monkeypatch, tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text(
+        "[build-system]\n"
+        "requires=['setuptools>=69','wheel']\n"
+        "build-backend='setuptools.build_meta'\n"
+        "[project]\n"
+        "name='resource-hunter'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        packaging_smoke,
+        "packaging_status",
+        lambda python_executable=None: {
+            "pip": True,
+            "venv": False,
+            "setuptools_build_meta": False,
+            "wheel": False,
+            "wheel_build_ready": False,
+            "python_module_smoke_ready": False,
+            "console_script_smoke_ready": False,
+            "full_packaging_smoke_ready": False,
+            "blockers": ["setuptools.build_meta", "wheel"],
+            "optional_gaps": ["venv"],
+            "console_script_strategy": "blocked",
+        },
+    )
+
+    recorded: list[dict[str, object]] = []
+
+    def fake_run_command(args, *, cwd, env=None, timeout=180):
+        recorded.append({"args": args, "cwd": str(cwd), "env": env})
+        if args[1:4] == ["-m", "pip", "install"] and "--target" in args:
+            return {
+                "command": args,
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": "bootstrapped",
+                "stderr": "",
+            }
+        if args[1:4] == ["-m", "pip", "wheel"]:
+            dist_dir = Path(args[args.index("--wheel-dir") + 1])
+            (dist_dir / "resource_hunter-2.0.0-py3-none-any.whl").write_text("wheel", encoding="utf-8")
+            return {
+                "command": args,
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": "built",
+                "stderr": "",
+            }
+        if args[1:4] == ["-m", "pip", "install"] and "--prefix" in args:
+            install_root = Path(args[args.index("--prefix") + 1])
+            console_script = packaging_smoke._prefix_console_script(install_root, "resource-hunter")
+            console_script.parent.mkdir(parents=True, exist_ok=True)
+            console_script.write_text("", encoding="utf-8")
+            return {
+                "command": args,
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": "installed",
+                "stderr": "",
+            }
+        if args[1:3] == ["-m", "resource_hunter"] and args[-1] == "--help":
+            return {
+                "command": args,
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": "usage: resource-hunter [-h]\n",
+                "stderr": "",
+            }
+        if args[1:3] == ["-m", "resource_hunter"] and args[-1] == "--version":
+            return {
+                "command": args,
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": f"resource-hunter {__version__}",
+                "stderr": "",
+            }
+        if args[-1] == "--help":
+            return {
+                "command": args,
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": "usage: resource-hunter [-h]\n",
+                "stderr": "",
+            }
+        if args[-1] == "--version":
+            return {
+                "command": args,
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": f"resource-hunter {__version__}",
+                "stderr": "",
+            }
+        raise AssertionError(f"Unexpected command: {args}")
+
+    monkeypatch.setattr(packaging_smoke, "_run_command", fake_run_command)
+
+    payload = packaging_smoke.run_packaging_smoke(project_root=project_root, bootstrap_build_deps=True)
+
+    assert payload["ok"] is True
+    assert payload["strategy"] == "prefix-install"
+    assert payload["strategy_family"] == "usable"
+    assert payload["bootstrapped_build_requirements"] == ["setuptools>=69", "wheel"]
+    assert payload["steps"][0]["name"] == "bootstrap-build-deps"
+    build_step = next(step for step in payload["steps"] if step["name"] == "build-wheel")
+    assert build_step["ok"] is True
+    assert payload["bootstrap_overlay"] is not None
+    build_call = next(item for item in recorded if item["args"][1:4] == ["-m", "pip", "wheel"])
+    assert build_call["env"]["PYTHONPATH"] == payload["bootstrap_overlay"]
+
+
+def test_packaging_status_probes_target_python(monkeypatch):
+    recorded: list[list[str]] = []
+
+    def fake_run_command(args, *, cwd, env=None, timeout=180):
+        recorded.append(args)
+        return {
+            "command": args,
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "pip": True,
+                    "venv": False,
+                    "setuptools.build_meta": True,
+                    "wheel": True,
+                }
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(packaging_smoke, "_run_command", fake_run_command)
+
+    status = packaging_smoke.packaging_status(python_executable="/tmp/alt-python")
+
+    assert recorded and recorded[0][0] == "/tmp/alt-python"
+    assert recorded[0][1] != "-c"
+    assert Path(recorded[0][1]).name == "probe_packaging_modules.py"
+    assert status == {
+        "pip": True,
+        "venv": False,
+        "setuptools_build_meta": True,
+        "wheel": True,
+        "wheel_build_ready": True,
+        "python_module_smoke_ready": True,
+        "console_script_smoke_ready": True,
+        "full_packaging_smoke_ready": True,
+        "blockers": [],
+        "optional_gaps": ["venv"],
+        "console_script_strategy": "prefix-install",
+    }
+
+
+def test_packaging_status_reports_probe_errors(monkeypatch):
+    def fake_run_command(args, *, cwd, env=None, timeout=180):
+        return {
+            "command": args,
+            "cwd": str(cwd),
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "python launcher failed",
+        }
+
+    monkeypatch.setattr(packaging_smoke, "_run_command", fake_run_command)
+
+    status = packaging_smoke.packaging_status(python_executable="/tmp/missing-python")
+
+    assert status == {
+        "pip": None,
+        "venv": None,
+        "setuptools_build_meta": None,
+        "wheel": None,
+        "wheel_build_ready": False,
+        "python_module_smoke_ready": False,
+        "console_script_smoke_ready": False,
+        "full_packaging_smoke_ready": False,
+        "blockers": [],
+        "optional_gaps": [],
+        "console_script_strategy": "blocked",
+        "error": "Unable to inspect packaging modules via /tmp/missing-python: python launcher failed",
+    }
+
+
+def test_select_packaging_python_accepts_bootstrap_capable_candidates(monkeypatch, tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text(
+        "[build-system]\nrequires=['setuptools>=69','wheel']\nbuild-backend='setuptools.build_meta'\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        packaging_smoke,
+        "_packaging_python_candidates",
+        lambda: [("current", "/tmp/current-python"), ("path:python", "/tmp/bootstrap-python")],
+    )
+
+    def fake_packaging_status(*, python_executable=None):
+        if python_executable == "/tmp/bootstrap-python":
+            return {
+                "pip": True,
+                "venv": False,
+                "setuptools_build_meta": False,
+                "wheel": False,
+                "wheel_build_ready": False,
+                "python_module_smoke_ready": False,
+                "console_script_smoke_ready": False,
+                "full_packaging_smoke_ready": False,
+                "blockers": ["setuptools.build_meta", "wheel"],
+                "optional_gaps": ["venv"],
+                "console_script_strategy": "blocked",
+            }
+        return {
+            "pip": False,
+            "venv": False,
+            "setuptools_build_meta": False,
+            "wheel": False,
+            "wheel_build_ready": False,
+            "python_module_smoke_ready": False,
+            "console_script_smoke_ready": False,
+            "full_packaging_smoke_ready": False,
+            "blockers": ["pip", "setuptools.build_meta", "wheel"],
+            "optional_gaps": ["venv"],
+            "console_script_strategy": "blocked",
+        }
+
+    monkeypatch.setattr(packaging_smoke, "packaging_status", fake_packaging_status)
+
+    python_executable, candidates = packaging_smoke.select_packaging_python(
+        project_root=project_root,
+        allow_bootstrap_build_deps=True,
+    )
+
+    assert python_executable == "/tmp/bootstrap-python"
+    assert candidates[0]["ready"] is False
+    assert candidates[1]["ready"] is True
+    assert candidates[1]["bootstrap_ready"] is True
+    assert candidates[1]["packaging"]["project_root"] == str(project_root)
+    assert candidates[1]["packaging"]["project_root_source"] == "argument"
+    assert candidates[1]["packaging"]["bootstrap_build_deps_ready"] is True
+    assert candidates[1]["packaging"]["bootstrap_build_requirements"] == ["setuptools>=69", "wheel"]
+    assert candidates[1]["packaging"]["packaging_smoke_ready_with_bootstrap"] is True
+
+
+def test_run_packaging_smoke_checks_target_python_status(monkeypatch, tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+    recorded: list[str | None] = []
+
+    def fake_packaging_status(*, python_executable=None):
+        recorded.append(python_executable)
+        return {
+            "pip": True,
+            "venv": False,
+            "setuptools_build_meta": False,
+            "wheel": False,
+            "wheel_build_ready": False,
+            "python_module_smoke_ready": False,
+            "console_script_smoke_ready": False,
+            "full_packaging_smoke_ready": False,
+            "blockers": ["setuptools.build_meta", "wheel"],
+            "optional_gaps": ["venv"],
+            "console_script_strategy": "blocked",
+        }
+
+    monkeypatch.setattr(packaging_smoke, "packaging_status", fake_packaging_status)
+
+    payload = packaging_smoke.run_packaging_smoke(project_root=project_root, python_executable="/tmp/alt-python")
+
+    assert recorded == ["/tmp/alt-python"]
+    assert payload["ok"] is False
+    assert payload["packaging_python"] == "/tmp/alt-python"
+    assert payload["packaging_python_source"] == "argument"
+    assert payload["project_root_source"] == "argument"
+    assert payload["strategy"] == "blocked"
+
+
+def test_run_packaging_smoke_accepts_packaging_python_provenance(monkeypatch, tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+    candidates = [
+        {
+            "python": "/tmp/ready-python",
+            "source": "path:python",
+            "ready": True,
+            "packaging": {
+                "blockers": [],
+                "optional_gaps": [],
+                "console_script_strategy": "venv",
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        packaging_smoke,
+        "packaging_status",
+        lambda python_executable=None: {
+            "pip": True,
+            "venv": False,
+            "setuptools_build_meta": False,
+            "wheel": False,
+            "wheel_build_ready": False,
+            "python_module_smoke_ready": False,
+            "console_script_smoke_ready": False,
+            "full_packaging_smoke_ready": False,
+            "blockers": ["setuptools.build_meta", "wheel"],
+            "optional_gaps": ["venv"],
+            "console_script_strategy": "blocked",
+        },
+    )
+
+    payload = packaging_smoke.run_packaging_smoke(
+        project_root=project_root,
+        python_executable="/tmp/ready-python",
+        packaging_python_source="auto",
+        packaging_python_candidates=candidates,
+        packaging_python_auto_selected=True,
+    )
+
+    assert payload["ok"] is False
+    assert payload["packaging_python"] == "/tmp/ready-python"
+    assert payload["packaging_python_source"] == "auto"
+    assert payload["project_root_source"] == "argument"
+    assert payload["packaging_python_candidates"] == candidates
+    assert payload["packaging_python_auto_selected"] is True
+
+
+def test_run_packaging_smoke_short_circuits_on_packaging_probe_error(monkeypatch, tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / "src" / "resource_hunter").mkdir(parents=True)
+    (project_root / "pyproject.toml").write_text("[project]\nname='resource-hunter'\n", encoding="utf-8")
+    monkeypatch.setattr(
+        packaging_smoke,
+        "packaging_status",
+        lambda python_executable=None: {
+            "pip": None,
+            "venv": None,
+            "setuptools_build_meta": None,
+            "wheel": None,
+            "wheel_build_ready": False,
+            "python_module_smoke_ready": False,
+            "console_script_smoke_ready": False,
+            "full_packaging_smoke_ready": False,
+            "blockers": [],
+            "optional_gaps": [],
+            "console_script_strategy": "blocked",
+            "error": "Unable to inspect packaging modules via /tmp/missing-python: launcher failed",
+        },
+    )
+
+    payload = packaging_smoke.run_packaging_smoke(project_root=project_root, python_executable="/tmp/missing-python")
+
+    assert payload["ok"] is False
+    assert payload["strategy"] == "blocked"
+    assert payload["strategy_family"] == "blocked"
+    assert payload["steps"] == []
+    assert payload["failed_step"] == "packaging-status"
+    assert payload["packaging"]["error"] == "Unable to inspect packaging modules via /tmp/missing-python: launcher failed"
+    assert payload["reason"] == "Packaging smoke is blocked: Unable to inspect packaging modules via /tmp/missing-python: launcher failed"
+
+
+def test_format_packaging_smoke_text_reports_python_source():
+    payload = {
+        "ok": True,
+        "reason": "Packaging smoke passed.",
+        "python": "/tmp/env-python",
+        "packaging_python": "/tmp/env-python",
+        "packaging_python_source": "environment",
+        "project_root": "/tmp/repo",
+        "packaging": {"blockers": [], "console_script_strategy": "venv"},
+        "strategy": "venv",
+        "strategy_family": "usable",
+        "workspace": "/tmp/work",
+        "wheel": "/tmp/dist/resource_hunter-1.0.0-py3-none-any.whl",
+        "console_script": "/tmp/venv/bin/resource-hunter",
+        "steps": [],
+    }
+
+    text = packaging_smoke.format_packaging_smoke_text(payload)
+
+    assert "Python: /tmp/env-python (via RESOURCE_HUNTER_PACKAGING_PYTHON)" in text
+    assert "strategy_family: usable" in text
+
+
+def test_format_packaging_smoke_text_reports_bootstrap_details():
+    payload = {
+        "ok": True,
+        "reason": "Packaging smoke passed.",
+        "python": "/tmp/env-python",
+        "packaging_python": "/tmp/env-python",
+        "packaging_python_source": "current",
+        "project_root": "/tmp/repo",
+        "packaging": {"blockers": [], "console_script_strategy": "prefix-install"},
+        "strategy": "prefix-install",
+        "strategy_family": "usable",
+        "workspace": "/tmp/work",
+        "wheel": "/tmp/dist/resource_hunter-1.0.0-py3-none-any.whl",
+        "console_script": "/tmp/prefix/bin/resource-hunter",
+        "bootstrapped_build_requirements": ["setuptools>=69", "wheel"],
+        "steps": [],
+    }
+
+    text = packaging_smoke.format_packaging_smoke_text(payload)
+
+    assert "build_dependency_bootstrap: setuptools>=69, wheel" in text
+
+
+def test_format_packaging_smoke_text_reports_requested_project_root_when_it_differs():
+    payload = {
+        "ok": False,
+        "reason": "Packaging smoke requires a project root containing pyproject.toml and src/resource_hunter.",
+        "python": sys.executable,
+        "project_root": None,
+        "project_root_source": "argument",
+        "requested_project_root": "/tmp/repo/scripts",
+        "packaging_python": sys.executable,
+        "packaging_python_source": "current",
+        "packaging": {
+            "blockers": [],
+            "console_script_strategy": "blocked",
+            "project_root": None,
+            "project_root_source": "argument",
+        },
+        "strategy": "blocked",
+        "strategy_family": "blocked",
+        "steps": [],
+    }
+
+    text = packaging_smoke.format_packaging_smoke_text(payload)
+
+    assert "requested_project_root: /tmp/repo/scripts" in text
+    assert "project_root_source: argument" in text
+
+
+@pytest.mark.parametrize(
+    ("script_name", "args", "expected_text"),
+    [
+        ("hunt.py", ["--help"], "usage:"),
+        ("pansou.py", ["--help"], "Legacy pan search wrapper"),
+        ("torrent.py", ["--help"], "Legacy torrent search wrapper"),
+        ("video.py", ["--help"], "usage:"),
+    ],
+)
+def test_legacy_wrapper_help_smoke(tmp_path, script_name, args, expected_text):
+    result = _run_command([sys.executable, str(SCRIPTS / script_name), *args], cwd=tmp_path)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert expected_text in result.stdout
+
+
+def test_venv_console_script_prefers_generated_entrypoint(tmp_path):
+    scripts_dir = tmp_path / ("Scripts" if os.name == "nt" else "bin")
+    scripts_dir.mkdir()
+    expected = scripts_dir / ("resource-hunter.exe" if os.name == "nt" else "resource-hunter")
+    expected.write_text("", encoding="utf-8")
+    if os.name == "nt":
+        (scripts_dir / "resource-hunter").write_text("", encoding="utf-8")
+
+    assert _venv_console_script(tmp_path, "resource-hunter") == expected
+
+
+def test_prefix_console_script_prefers_generated_entrypoint(tmp_path):
+    scripts_dir, _ = _prefix_paths(tmp_path)
+    scripts_dir.mkdir(parents=True)
+    expected = scripts_dir / ("resource-hunter.exe" if os.name == "nt" else "resource-hunter")
+    expected.write_text("", encoding="utf-8")
+    if os.name == "nt":
+        (scripts_dir / "resource-hunter").write_text("", encoding="utf-8")
+
+    assert _prefix_console_script(tmp_path, "resource-hunter") == expected
+
+
+def test_python_m_resource_hunter_help_after_wheel_install(tmp_path):
+    if not _supports_wheel_build():
+        pytest.skip("pip, wheel, or setuptools build backend unavailable in this interpreter")
+
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+
+    build_result = _run_command(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(dist_dir),
+            str(ROOT),
+        ],
+        cwd=ROOT,
+    )
+    assert build_result.returncode == 0, build_result.stderr or build_result.stdout
+
+    wheels = sorted(dist_dir.glob("resource_hunter-*.whl"))
+    assert len(wheels) == 1
+
+    if _supports_venv():
+        import venv
+
+        venv_dir = tmp_path / "venv"
+        venv.EnvBuilder(with_pip=True, clear=True).create(venv_dir)
+        venv_python = _venv_python(venv_dir)
+        install_result = _run_command(
+            [str(venv_python), "-m", "pip", "install", "--no-index", str(wheels[0])],
+            cwd=tmp_path,
+        )
+        assert install_result.returncode == 0, install_result.stderr or install_result.stdout
+        help_result = _run_command([str(venv_python), "-m", "resource_hunter", "--help"], cwd=tmp_path)
+        version_result = _run_command([str(venv_python), "-m", "resource_hunter", "--version"], cwd=tmp_path)
+        console_script = _venv_console_script(venv_dir, "resource-hunter")
+        assert console_script.exists(), f"console script not generated: {console_script}"
+        console_help_result = _run_command([str(console_script), "--help"], cwd=tmp_path)
+        console_version_result = _run_command([str(console_script), "--version"], cwd=tmp_path)
+    else:
+        install_root = tmp_path / "wheel-install"
+        install_result = _run_command(
+            [sys.executable, "-m", "pip", "install", "--no-index", "--prefix", str(install_root), str(wheels[0])],
+            cwd=tmp_path,
+        )
+        assert install_result.returncode == 0, install_result.stderr or install_result.stdout
+        env = _prefix_env(install_root)
+        help_result = _run_command([sys.executable, "-m", "resource_hunter", "--help"], cwd=tmp_path, env=env)
+        version_result = _run_command([sys.executable, "-m", "resource_hunter", "--version"], cwd=tmp_path, env=env)
+        console_script = _prefix_console_script(install_root, "resource-hunter")
+        assert console_script.exists(), f"console script not generated: {console_script}"
+        console_help_result = _run_command([str(console_script), "--help"], cwd=tmp_path, env=env)
+        console_version_result = _run_command([str(console_script), "--version"], cwd=tmp_path, env=env)
+
+    assert help_result.returncode == 0, help_result.stderr or help_result.stdout
+    assert "usage:" in help_result.stdout
+    assert "search" in help_result.stdout
+    assert version_result.returncode == 0, version_result.stderr or version_result.stdout
+    assert version_result.stdout.strip() == f"resource-hunter {__version__}"
+    if console_help_result is not None:
+        assert console_help_result.returncode == 0, console_help_result.stderr or console_help_result.stdout
+        assert "usage:" in console_help_result.stdout
+        assert "search" in console_help_result.stdout
+    if console_version_result is not None:
+        assert console_version_result.returncode == 0, console_version_result.stderr or console_version_result.stdout
+        assert console_version_result.stdout.strip() == f"resource-hunter {__version__}"

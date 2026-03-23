@@ -197,6 +197,64 @@ def test_pan_aggregated_magnet_normalizes_to_torrent_channel():
     assert results[0].source == "2fun"
 
 
+def test_tieba_thread_source_extracts_pan_and_password(monkeypatch):
+    source = pc.TiebaSource()
+
+    def fake_search_results(self, query, http_client):
+        return [{"url": "https://tieba.baidu.com/p/123456", "title": "赤橙黄绿青蓝紫 资源贴"}]
+
+    class FakeHTTPClient:
+        def get_text(self, url, timeout=None):
+            return (
+                '<html><title>赤橙黄绿青蓝紫 资源贴</title>'
+                '夸克：https://pan.quark.cn/s/abc123def456 提取码: 7788'
+                "</html>"
+            )
+
+    monkeypatch.setattr(pc.AliasResolver, "search_results", fake_search_results)
+    results = source.search(
+        "赤橙黄绿青蓝紫 1982",
+        parse_intent("赤橙黄绿青蓝紫 1982", explicit_kind="movie"),
+        limit=5,
+        page=1,
+        http_client=FakeHTTPClient(),
+    )
+    assert results
+    assert results[0].source == "tieba"
+    assert results[0].provider == "quark"
+    assert results[0].password == "7788"
+
+
+def test_tieba_thread_source_returns_manual_clue_when_only_filename_and_password(monkeypatch):
+    source = pc.TiebaSource()
+
+    def fake_search_results(self, query, http_client):
+        return [{"url": "https://tieba.baidu.com/p/10559210059", "title": "赤橙黄绿青蓝紫 资源贴"}]
+
+    class FakeHTTPClient:
+        def get_text(self, url, timeout=None):
+            return (
+                "<html>"
+                "通过百度网盘分享的文件：赤橙黄绿青蓝紫"
+                "提取码:y3bq"
+                "</html>"
+            )
+
+    monkeypatch.setattr(pc.AliasResolver, "search_results", fake_search_results)
+    results = source.search(
+        "赤橙黄绿青蓝紫 1982",
+        parse_intent("赤橙黄绿青蓝紫 1982", explicit_kind="movie"),
+        limit=5,
+        page=1,
+        http_client=FakeHTTPClient(),
+    )
+    assert results
+    assert results[0].provider == "baidu_clue"
+    assert results[0].password == "y3bq"
+    assert results[0].link_or_magnet == "https://tieba.baidu.com/p/10559210059"
+    assert results[0].raw["manual_follow_up"] is True
+
+
 def test_titles_that_only_mention_target_do_not_enter_exact_bucket(tmp_path):
     cache = ResourceCache(tmp_path / "cache.db")
     engine = ResourceHunterEngine(cache=cache)
@@ -306,3 +364,31 @@ def test_default_degraded_source_recovers_after_probe_or_real_success(tmp_path):
         )
     )
     assert pc._source_is_degraded(cache2, "yts") is False
+
+
+def test_search_json_meta_includes_request_id_and_timings(tmp_path):
+    cache = ResourceCache(tmp_path / "cache.db")
+    engine = ResourceHunterEngine(cache=cache)
+    engine.pan_sources = []
+    engine.torrent_sources = [
+        FakeSource(
+            "tpb",
+            "torrent",
+            2,
+            [
+                SearchResult(
+                    channel="torrent",
+                    source="tpb",
+                    provider="magnet",
+                    title="Oppenheimer 2023 2160p HDR",
+                    link_or_magnet="magnet:?xt=urn:btih:abc",
+                    share_id_or_info_hash="abc",
+                    seeders=12,
+                )
+            ],
+        )
+    ]
+    response = engine.search(parse_intent("Oppenheimer 2023", explicit_kind="movie"), use_cache=False)
+    assert response["meta"]["request_id"]
+    assert response["meta"]["timings_ms"]["total"] >= 0
+    assert "fetch" in response["meta"]["timings_ms"]

@@ -21,7 +21,8 @@ Do not use this skill for:
 ## Main entrypoint
 
 ```bash
-SKILL_DIR="$(openclaw skills path resource-hunter)/scripts"
+SKILL_ROOT="$(openclaw skills path resource-hunter)"
+SKILL_DIR="$SKILL_ROOT/scripts"
 python3 "$SKILL_DIR/hunt.py" search "<query>"
 ```
 
@@ -31,6 +32,13 @@ Legacy entrypoints still work:
 python3 "$SKILL_DIR/pansou.py" "<query>"
 python3 "$SKILL_DIR/torrent.py" "<query>"
 python3 "$SKILL_DIR/video.py" info "<url>"
+```
+
+Standard package entrypoints are also supported after installation:
+
+```bash
+python -m resource_hunter search "<query>"
+resource-hunter search "<query>"
 ```
 
 ## Default routing
@@ -53,12 +61,63 @@ python3 "$SKILL_DIR/hunt.py" video probe "https://www.bilibili.com/video/BV..."
 python3 "$SKILL_DIR/hunt.py" video download "https://youtu.be/..." balanced
 python3 "$SKILL_DIR/hunt.py" sources
 python3 "$SKILL_DIR/hunt.py" doctor
+python3 "$SKILL_DIR/hunt.py" doctor --json --require-packaging-ready
+python3 "$SKILL_DIR/hunt.py" doctor --json --python /path/to/python --require-packaging-ready
+python3 "$SKILL_DIR/hunt.py" doctor --json --python auto --require-packaging-ready
+python3 "$SKILL_DIR/hunt.py" doctor --json --project-root /path/to/repo --python auto --bootstrap-build-deps --require-packaging-ready
+python3 "$SKILL_DIR/hunt.py" doctor --json --python auto --bootstrap-build-deps --require-packaging-ready
+python3 "$SKILL_DIR/hunt.py" packaging-smoke --json
+python3 "$SKILL_DIR/hunt.py" packaging-smoke --json --python /path/to/python
+python3 "$SKILL_DIR/hunt.py" packaging-smoke --json --python auto
+python3 "$SKILL_DIR/hunt.py" packaging-baseline --project-root /path/to/repo --python auto --bootstrap-build-deps --output-dir artifacts/packaging-baseline --require-expected-outcomes
+python3 "$SKILL_DIR/hunt.py" packaging-baseline-report artifacts/packaging-baseline/packaging-baseline.json
+python3 "$SKILL_DIR/hunt.py" packaging-baseline-report artifacts/downloaded-gh-artifacts --json --require-contract-ok
 ```
 
 ## Output modes
 
 - Default: short human-readable recommendations with reasons
-- `--json`: stable machine-readable payload with `query`, `intent`, `plan`, `results`, `warnings`, `source_status`, and `meta`
+- `--json`: stable machine-readable payload with `query`, `intent`, `plan`, `results`, `warnings`, `source_status`, and `meta`; `doctor --json` and `packaging-smoke --json` also surface packaging probe failures under `packaging.error`, the resolved checkout root via `project_root` / `packaging.project_root`, and the root provenance via `project_root_source` / `packaging.project_root_source`
+
+### Packaging probe-error examples
+
+When a requested `--python` path cannot be inspected, both commands keep returning structured JSON. Key on `packaging.error` instead of treating the run as an unstructured crash.
+
+```bash
+python3 "$SKILL_DIR/hunt.py" doctor --json --python /bad/path
+```
+
+```json
+{
+  "packaging_python": "/bad/path",
+  "packaging_python_source": "argument",
+  "packaging": {
+    "pip": null,
+    "venv": null,
+    "setuptools_build_meta": null,
+    "wheel": null,
+    "console_script_strategy": "blocked",
+    "error": "Unable to inspect packaging modules via /bad/path: <launcher error>"
+  }
+}
+```
+
+```bash
+python3 "$SKILL_DIR/hunt.py" packaging-smoke --json --python /bad/path
+```
+
+```json
+{
+  "ok": false,
+  "strategy": "blocked",
+  "reason": "Packaging smoke is blocked: Unable to inspect packaging modules via /bad/path: <launcher error>",
+  "packaging_python": "/bad/path",
+  "packaging_python_source": "argument",
+  "packaging": {
+    "error": "Unable to inspect packaging modules via /bad/path: <launcher error>"
+  }
+}
+```
 
 ## Notes for agent behavior
 
@@ -66,6 +125,8 @@ python3 "$SKILL_DIR/hunt.py" doctor
 - Use `--quick` in chat when the user wants a short answer
 - Use `--json` when another tool or script will consume the output
 - If the user provides a public video URL, do not search pan/torrent first; go straight to the video pipeline
+- When validating installability or CI readiness, run `doctor --json --require-packaging-ready` first and then `packaging-smoke --json`; both commands now report `project_root`, `project_root_source`, `packaging.project_root`, `packaging.project_root_source`, `packaging_python`, its source, and any probe failure in `packaging.error`, so add `--python` when the packaging-capable interpreter differs from the current launcher, set `RESOURCE_HUNTER_PACKAGING_PYTHON` once so both commands reuse the same target interpreter, or use `--python auto` / `RESOURCE_HUNTER_PACKAGING_PYTHON=auto` to scan the current interpreter, active envs, PATH, and the Windows `py` launcher for a packaging-ready fallback. Add `--project-root` when CI or ops runs outside the target checkout, and add `--bootstrap-build-deps` when lean runtimes should still count as installable because they can bootstrap the checkout's declared build requirements into a disposable overlay.
+- When consuming archived packaging baselines, `packaging-baseline-report` can read one baseline file, multiple explicit files, or a directory tree of downloaded CI artifacts; add `--json` for aggregate machine-readable output and `--require-contract-ok` when downstream automation should fail after printing the report if any archived artifact drifts from the expected passing-vs-blocked contract.
 - If the user explicitly wants only pan or only torrent, set `--channel pan` or `--channel torrent`
 
 ## References

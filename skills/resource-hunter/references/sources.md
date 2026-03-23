@@ -14,6 +14,10 @@
   - Channel: `pan`
   - Priority: `3`
   - Role: extra fallback pan source
+- `tieba`
+  - Channel: `pan`
+  - Priority: `4`
+  - Role: supplemental thread source that extracts pan links and magnets from public Baidu Tieba posts
 
 ## Torrent sources
 
@@ -40,9 +44,9 @@
 
 ## Default routing matrix
 
-- Movie: `2fun -> hunhepan -> pansou.vip`, then `yts -> tpb -> 1337x`
-- TV: `eztv -> tpb -> 1337x`, then pan sources
-- Anime: `nyaa -> tpb -> 1337x`, then pan sources
+- Movie: `2fun -> hunhepan -> pansou.vip -> tieba`, then `yts -> tpb -> 1337x`
+- TV: `eztv -> tpb -> 1337x`, then pan sources including `tieba`
+- Anime: `nyaa -> tpb -> 1337x`, then pan sources including `tieba`
 - Music/software/book/general: pan sources first, torrent sources second
 - Public video URL: no pan/torrent search; route directly to video workflow
 
@@ -58,3 +62,4 @@
 - External public sources may throttle, change formats, or break without notice
 - Coverage quality varies by query and source index freshness
 - `pansou.vip` endpoint shape is handled conservatively with fallbacks because the public API is unstable
+- `tieba` is treated as a degraded supplemental source because public thread pages and search-engine indexing are unstable

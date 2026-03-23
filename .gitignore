@@ -1,7 +1,12 @@
 __pycache__/
 .pytest_cache/
+.ruff_cache/
 *.pyc
 *.pyo
 *.log
 .DS_Store
 Thumbs.db
+skills/resource-hunter/artifacts/packaging-baseline-local/
+skills/resource-hunter/build/
+skills/resource-hunter/dist/
+skills/resource-hunter/src/*.egg-info/

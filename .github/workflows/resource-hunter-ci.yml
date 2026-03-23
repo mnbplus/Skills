@@ -1,0 +1,66 @@
+name: resource-hunter-ci
+
+on:
+  push:
+    paths:
+      - "skills/resource-hunter/**"
+      - ".github/workflows/resource-hunter-ci.yml"
+  pull_request:
+    paths:
+      - "skills/resource-hunter/**"
+      - ".github/workflows/resource-hunter-ci.yml"
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    env:
+      RESOURCE_HUNTER_PROJECT_ROOT: ./skills/resource-hunter
+      RESOURCE_HUNTER_PACKAGING_ARTIFACT_DIR: ./skills/resource-hunter/artifacts/packaging-baseline
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: python -m pip install --upgrade pip && python -m pip install -e "./skills/resource-hunter[dev]"
+
+      - name: Ruff
+        run: ruff check ./skills/resource-hunter
+
+      - name: Pytest
+        run: pytest ./skills/resource-hunter/tests
+
+      - name: Build
+        run: python -m build ./skills/resource-hunter
+
+      - name: Packaging baseline
+        id: packaging_baseline
+        continue-on-error: true
+        run: >-
+          python -m resource_hunter packaging-baseline
+          --project-root "${{ env.RESOURCE_HUNTER_PROJECT_ROOT }}"
+          --python auto
+          --bootstrap-build-deps
+          --output-dir "${{ env.RESOURCE_HUNTER_PACKAGING_ARTIFACT_DIR }}"
+          --require-expected-outcomes
+
+      - name: Upload packaging baseline artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-hunter-packaging-baseline-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ${{ env.RESOURCE_HUNTER_PACKAGING_ARTIFACT_DIR }}
+          if-no-files-found: ignore
+
+      - name: Enforce packaging baseline expectations
+        if: steps.packaging_baseline.outcome == 'failure'
+        run: |
+          echo "Packaging baseline requirement failed; inspect the uploaded baseline artifacts."
+          exit 1

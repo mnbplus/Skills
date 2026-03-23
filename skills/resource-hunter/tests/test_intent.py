@@ -35,3 +35,8 @@ def test_build_plan_respects_routing_preferences():
     assert movie_plan.channels == ["pan", "torrent"]
     assert movie_plan.preferred_torrent_sources[0] == "yts"
     assert any("2160p" in item.lower() or "4k" in item.lower() for item in movie_plan.pan_queries + movie_plan.torrent_queries)
+
+
+def test_chinese_title_with_year_defaults_to_movie():
+    intent = parse_intent("赤橙黄绿青蓝紫 1982")
+    assert intent.kind == "movie"
