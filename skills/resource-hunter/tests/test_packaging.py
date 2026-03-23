@@ -1174,6 +1174,22 @@ def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
     assert gate_github_json_result.returncode == 0, gate_github_json_result.stderr or gate_github_json_result.stdout
     assert gate_github_json_result.stderr == ""
     gate_github_payload = json.loads(gate_github_json_result.stdout)
+    expected_gh_download_paths = [
+        str(
+            (
+                gh_download_dir
+                / "resource-hunter-packaging-baseline-ubuntu-latest-py3.12"
+                / "packaging-baseline.json"
+            ).resolve()
+        ),
+        str(
+            (
+                gh_download_dir
+                / "resource-hunter-packaging-baseline-windows-latest-py3.12"
+                / "packaging-baseline.json"
+            ).resolve()
+        ),
+    ]
     assert gate_github_payload == packaging_gate.build_packaging_baseline_gate_payload(
         packaging_report.read_packaging_baseline_reports([gh_download_dir]),
         required_artifact_count=2,
@@ -1187,6 +1203,10 @@ def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
             "artifact_names": [],
             "artifact_patterns": [packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN],
             "artifact_filter_source": "default",
+            "resolved_artifact_count": 2,
+            "resolved_artifact_paths": expected_gh_download_paths,
+            "resolved_archive_member_count": 0,
+            "resolved_filesystem_artifact_count": 2,
             "download_command": gate_github_payload["download"]["download_command"],
         },
     )
