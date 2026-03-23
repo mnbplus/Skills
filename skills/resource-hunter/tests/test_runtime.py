@@ -583,6 +583,12 @@ def test_packaging_status_probes_external_python_with_hosted_setuptools_assertio
         encoding="utf-8",
     )
     (injected_modules / "wheel.py").write_text("# probe fallback\n", encoding="utf-8")
+    setuptools_dist_info = injected_modules / "setuptools-999.dist-info"
+    setuptools_dist_info.mkdir()
+    (setuptools_dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: setuptools\nVersion: 999\n",
+        encoding="utf-8",
+    )
 
     def fake_run_command(args, *, cwd, env=None, timeout=180):
         command_env = packaging_smoke._clean_env()
