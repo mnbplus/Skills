@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -24,25 +25,52 @@ _PROBED_MODULES = ("pip", "venv", "setuptools.build_meta", "wheel")
 _WINDOWS_STORE_ALIAS_NAMES = {"python.exe", "python3.exe", "pythonw.exe", "python3w.exe"}
 _BOOTSTRAPPABLE_BUILD_BLOCKERS = frozenset({"setuptools.build_meta", "wheel"})
 _FALLBACK_BUILD_REQUIREMENTS = ("setuptools>=69", "wheel")
+_MODULE_DISTRIBUTION_FALLBACKS = {"setuptools.build_meta": "setuptools"}
 _MODULE_PROBE_SCRIPT = "\n".join(
     [
+        "import importlib.metadata",
         "import importlib.util",
         "import json",
         "MODULES = ('pip', 'venv', 'setuptools.build_meta', 'wheel')",
+        "DISTRIBUTION_FALLBACKS = {'setuptools.build_meta': 'setuptools'}",
+        "def has_distribution(name):",
+        "    try:",
+        "        importlib.metadata.distribution(name)",
+        "    except importlib.metadata.PackageNotFoundError:",
+        "        return False",
+        "    return True",
         "def has(name):",
+        "    distribution = DISTRIBUTION_FALLBACKS.get(name)",
         "    try:",
         "        return importlib.util.find_spec(name) is not None",
-        "    except ModuleNotFoundError:",
+        "    except AssertionError:",
+        "        if distribution is not None:",
+        "            return has_distribution(distribution)",
+        "        return False",
+        "    except ImportError:",
         "        return False",
         "print(json.dumps({name: has(name) for name in MODULES}))",
     ]
 )
 
 
+def _distribution_available(distribution_name: str) -> bool:
+    try:
+        importlib.metadata.distribution(distribution_name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
 def module_available(module_name: str) -> bool:
+    distribution_name = _MODULE_DISTRIBUTION_FALLBACKS.get(module_name)
     try:
         return importlib.util.find_spec(module_name) is not None
-    except ModuleNotFoundError:
+    except AssertionError:
+        if distribution_name is not None:
+            return _distribution_available(distribution_name)
+        return False
+    except ImportError:
         return False
 
 
