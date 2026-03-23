@@ -574,6 +574,49 @@ def test_packaging_status_probes_external_python_via_temp_script(monkeypatch, tm
     }
 
 
+def test_packaging_status_probes_external_python_with_hosted_setuptools_assertion(monkeypatch, tmp_path):
+    injected_modules = tmp_path / "injected-modules"
+    setuptools_dir = injected_modules / "setuptools"
+    setuptools_dir.mkdir(parents=True)
+    (setuptools_dir / "__init__.py").write_text(
+        "raise AssertionError('hosted setuptools distutils override failed')\n",
+        encoding="utf-8",
+    )
+    (injected_modules / "wheel.py").write_text("# probe fallback\n", encoding="utf-8")
+
+    def fake_run_command(args, *, cwd, env=None, timeout=180):
+        command_env = packaging_smoke._clean_env()
+        command_env["PYTHONPATH"] = str(injected_modules)
+        result = subprocess.run(
+            args,
+            cwd=str(cwd),
+            env=command_env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "command": args,
+            "cwd": str(cwd),
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+
+    monkeypatch.setattr(packaging_smoke, "_same_python", lambda _: False)
+    monkeypatch.setattr(packaging_smoke, "_run_command", fake_run_command)
+
+    status = packaging_smoke.packaging_status(python_executable=sys.executable)
+
+    assert status["pip"] is True
+    assert status["setuptools_build_meta"] is True
+    assert status["wheel"] is True
+    assert status["full_packaging_smoke_ready"] is True
+    assert status["console_script_strategy"] in {"venv", "prefix-install"}
+    assert "error" not in status
+
+
 def test_doctor_advice_mentions_auto_discovery_failure(tmp_path):
     payload = {
         "python": "/usr/bin/current-python",
@@ -1197,3 +1240,143 @@ def test_packaging_report_script_downloads_github_run_artifacts_subprocess(tmp_p
         "--pattern",
         "resource-hunter-packaging-baseline-*",
     ]
+
+
+@pytest.mark.parametrize(
+    ("script_name", "script_args"),
+    [
+        ("packaging_verify.py", ()),
+        ("hunt.py", ("packaging-baseline-verify",)),
+    ],
+)
+def test_packaging_verify_entrypoints_download_github_run_artifacts_and_write_outputs_subprocess(
+    tmp_path,
+    monkeypatch,
+    script_name,
+    script_args,
+):
+    seed_root = tmp_path / "seed-gh-artifacts"
+    _write_packaging_baseline_artifact(
+        seed_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    _write_packaging_baseline_artifact(
+        seed_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=True,
+    )
+    fake_bin = tmp_path / "fake-gh-bin"
+    fake_bin.mkdir()
+    invocation_log = tmp_path / "fake-gh-invocation.json"
+    fake_gh_impl = fake_bin / "fake_gh.py"
+    fake_gh_impl.write_text(
+        "import json\n"
+        "import shutil\n"
+        "import sys\n"
+        "from pathlib import Path\n\n"
+        f"SEED_ROOT = Path(r'''{seed_root}''')\n"
+        f"INVOCATION_LOG = Path(r'''{invocation_log}''')\n\n"
+        "def main() -> int:\n"
+        "    args = sys.argv[1:]\n"
+        "    INVOCATION_LOG.write_text(json.dumps(args), encoding='utf-8')\n"
+        "    if args[:2] != ['run', 'download']:\n"
+        "        print(f'unexpected gh invocation: {args}', file=sys.stderr)\n"
+        "        return 1\n"
+        "    try:\n"
+        "        download_dir = Path(args[args.index('--dir') + 1])\n"
+        "    except (ValueError, IndexError):\n"
+        "        print('--dir is required', file=sys.stderr)\n"
+        "        return 1\n"
+        "    download_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    for child in SEED_ROOT.iterdir():\n"
+        "        target = download_dir / child.name\n"
+        "        if target.exists():\n"
+        "            shutil.rmtree(target)\n"
+        "        shutil.copytree(child, target)\n"
+        "    return 0\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        fake_gh = fake_bin / "gh.cmd"
+        fake_gh.write_text(
+            f'@echo off\r\n"{sys.executable}" "{fake_gh_impl}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            f'#!/bin/sh\n"{sys.executable}" "{fake_gh_impl}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+
+    original_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{original_path}")
+
+    output_dir = tmp_path / "verify-output"
+    output_archive = tmp_path / "verify-bundle.zip"
+    result = _run_source_checkout_script(
+        script_name,
+        *script_args,
+        "--json",
+        "--github-run",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--output-dir",
+        str(output_dir),
+        "--output-archive",
+        str(output_archive),
+        "--archive-downloads",
+        "--require-artifact-count",
+        "2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["report_ok"] is True
+    assert payload["gate_ok"] is True
+    assert payload["saved_outputs"] == {
+        "report_json": str((output_dir / "report.json").resolve()),
+        "report_text": str((output_dir / "report.txt").resolve()),
+        "gate_json": str((output_dir / "gate.json").resolve()),
+        "gate_text": str((output_dir / "gate.txt").resolve()),
+        "verify_json": str((output_dir / "verify.json").resolve()),
+        "verify_text": str((output_dir / "verify.txt").resolve()),
+        "bundle_manifest": str((output_dir / "bundle-manifest.json").resolve()),
+        "output_archive": str(output_archive.resolve()),
+    }
+    bundle_manifest = json.loads((output_dir / "bundle-manifest.json").read_text(encoding="utf-8"))
+    assert bundle_manifest["download_bundle_member_count"] == 2
+    assert bundle_manifest["download_bundle_members"] == [
+        "download/resource-hunter-packaging-baseline-ubuntu-latest-py3.12/packaging-baseline.json",
+        "download/resource-hunter-packaging-baseline-windows-latest-py3.13/packaging-baseline.json",
+    ]
+    with zipfile.ZipFile(output_archive) as archive:
+        assert archive.namelist() == [
+            "report.json",
+            "report.txt",
+            "gate.json",
+            "gate.txt",
+            "verify.json",
+            "verify.txt",
+            "bundle-manifest.json",
+            "download/resource-hunter-packaging-baseline-ubuntu-latest-py3.12/packaging-baseline.json",
+            "download/resource-hunter-packaging-baseline-windows-latest-py3.13/packaging-baseline.json",
+        ]
+    assert json.loads(invocation_log.read_text(encoding="utf-8")) == [
+        "run",
+        "download",
+        "123456",
+        "--repo",
+        "openclaw/resource-hunter",
+        "--dir",
+        str((output_dir / "download").resolve()),
+        "--pattern",
+        "resource-hunter-packaging-baseline-*",
+    ]
+

@@ -1,8 +1,8 @@
-# Next Action
+﻿# Next Action
 
-Push the CI probe-fallback fix and rerun the hosted matrix.
+Land the `packaging-baseline-verify` follow-up, then generate one synced evidence bundle from the latest green CI run.
 
-- Push the new commit on `resource-hunter-ci-fix-20260323-1402` so GitHub Actions reruns the existing workflow against the hosted Python 3.10 and 3.11 jobs that failed in run `23424246775`.
-- Watch the `test` matrix plus the existing packaging baseline report and gate jobs to confirm the probe no longer trips on hosted `setuptools._distutils_hack` behavior.
-- If any hosted job still fails, capture the exact failing matrix cell and compare its installed `setuptools`/`pip` versions before changing the packaging workflow contract.
-- Keep the aggregate packaging report/gate flow unchanged unless a new post-push run shows a separate regression.
+- Push the follow-up commit on `resource-hunter-ci-fix-20260323-1402` after review.
+- Run `python3 scripts/hunt.py packaging-baseline-verify --github-run latest --github-run-list-limit 100 --repo mnbplus/Skills --github-workflow resource-hunter-ci --output-dir <evidence-dir> --output-archive <evidence-zip> --archive-downloads --require-artifact-count 6 --json` against the published branch.
+- Review `verify.txt` and `report.txt` first to confirm the grouped failure summaries and bundle manifest line up with the hosted artifact set.
+- If verification drifts, use the grouped artifact labels to jump straight to the failing matrix legs and inspect their retained artifacts/logs.

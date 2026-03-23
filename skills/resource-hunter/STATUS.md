@@ -1,14 +1,17 @@
-# Status
+﻿# Status
 
 - Date: 2026-03-23
-- Task note: fixed the remaining GitHub Actions packaging-test failures on branch `resource-hunter-ci-fix-20260323-1402` after run `23424246775` exposed hosted-toolcache `setuptools`/`distutils` probe drift on Python 3.10/3.11.
-- Improvement shipped: the packaging capability probe now falls back to a fresh subprocess when the current interpreter trips the hosted `setuptools._distutils_hack` assertion, so packaging smoke and wheel-install entrypoint tests keep checking real wheel and console-script behavior instead of failing on the probe itself.
+- Task note: branch `resource-hunter-ci-fix-20260323-1402` is green on GitHub Actions (latest successful run `23429499018` for commit `e5d966f`), so this follow-up focuses on making future packaging-baseline triage faster and more repeatable offline.
+- Improvement shipped:
+  - Added a unified `packaging-baseline-verify` flow across the CLI, console entrypoint, and source-checkout wrapper so ops can verify retained artifact paths or download one GitHub Actions run once, then generate synchronized `report.json`, `report.txt`, `gate.json`, `gate.txt`, `verify.json`, `verify.txt`, and `bundle-manifest.json` outputs from the same artifact set.
+  - Extended the packaging baseline report/gate path with richer GitHub download metadata and grouped repeated requirement failures by artifact label in the text summaries so repeated matrix regressions are easier to spot during offline review.
+  - Fixed the single-artifact requirement-failure regression in `src/resource_hunter/packaging_report.py` that initially broke the new verifier/gate flow when evaluating local or downloaded artifacts.
 - Code changes:
-  - `skills/resource-hunter/src/resource_hunter/packaging_smoke.py` now keeps the fast in-process probe for normal cases, but transparently reruns the packaging-module probe in a clean subprocess when `setuptools.build_meta` resolution raises the hosted `distutils` assertion.
-  - `skills/resource-hunter/tests/test_packaging.py` now derives wheel-build readiness from `packaging_smoke.packaging_status(...)` instead of a fragile direct `importlib.util.find_spec("setuptools.build_meta")` call, and adds regression coverage for the current-interpreter subprocess fallback.
+  - `src/resource_hunter/packaging_verify.py`, `scripts/packaging_verify.py`, `src/resource_hunter/cli.py`, and `pyproject.toml` add the new verification entrypoint plus bundle-writing support.
+  - `src/resource_hunter/packaging_gate.py` and `src/resource_hunter/packaging_report.py` now preserve richer download/run context, support the combined verify flow, and emit grouped failure summaries for aggregate artifact reviews.
+  - `tests/test_packaging_verify.py`, `tests/test_packaging_report.py`, `tests/test_packaging_gate.py`, `tests/test_packaging_baseline_cli_report.py`, and `tests/test_runtime.py` lock the end-to-end CLI/runtime behavior.
+  - `README.md`, `SKILL.md`, `references/architecture.md`, and `references/usage.md` document the new verify workflow and evidence bundle outputs.
 - Validation:
-  - `E:/DevTools/python/python.exe -m pytest tests/test_packaging.py -k 'test_run_packaging_smoke_reports_missing_project_root or test_packaging_status_falls_back_to_subprocess_for_current_python_distutils_assertion or test_resource_hunter_entrypoints_after_wheel_install' -q`
-  - `E:/DevTools/python/python.exe -m pytest tests/test_packaging.py -k 'packaging_status or run_packaging_smoke_reports_missing_project_root' -q`
-  - `E:/DevTools/python/python.exe -m pytest tests/test_runtime.py -k 'test_packaging_status_' -q`
-  - `E:/DevTools/python/Scripts/ruff.exe check src/resource_hunter/packaging_smoke.py tests/test_packaging.py`
-- Saturation: the targeted CI root cause is addressed locally; the next bottleneck is pushing the commit and confirming the GitHub-hosted 3.10/3.11 matrix reruns cleanly with the existing packaging report/gate workflow unchanged.
+  - `E:/DevTools/python/python.exe -m pytest tests/test_packaging_verify.py tests/test_packaging_report.py tests/test_packaging_gate.py tests/test_packaging_baseline_cli_report.py tests/test_runtime.py -q` -> `90 passed, 1 skipped`
+  - `E:/DevTools/python/Scripts/ruff.exe check src/resource_hunter/packaging_verify.py src/resource_hunter/packaging_report.py src/resource_hunter/packaging_gate.py tests/test_packaging_verify.py tests/test_packaging_report.py tests/test_packaging_gate.py tests/test_packaging_baseline_cli_report.py tests/test_runtime.py` -> `All checks passed!`
+- Saturation: the local follow-up is validated; the next bottleneck is landing this commit on a runnable GitHub ref and generating one real evidence bundle from the latest green run so the new verifier path is proven against hosted artifacts.

@@ -13,7 +13,7 @@ from .cache import ResourceCache
 from .common import dump_json, ensure_utf8_stdio, storage_root
 from .core import ResourceHunterEngine, format_search_text, format_sources_text, parse_intent
 from .errors import ResourceHunterError
-from . import packaging_report
+from . import packaging_gate, packaging_report, packaging_verify
 from . import packaging_smoke as packaging_tools
 from .video_core import VideoManager, format_video_text
 
@@ -183,6 +183,73 @@ def _download_repo_text(download: dict[str, Any]) -> str:
     return repo_label
 
 
+def _download_run_text(download: dict[str, Any]) -> str:
+    run_label = str(download.get("run_id") or "unknown")
+    requested_run_id = download.get("requested_run_id")
+    if requested_run_id is None:
+        return run_label
+    requested_run_label = str(requested_run_id).strip()
+    if requested_run_label and requested_run_label != run_label:
+        return f"{run_label} (requested {requested_run_label})"
+    return run_label
+
+
+def _github_run_download_lines(download: dict[str, Any]) -> list[str]:
+    if download.get("provider") != "github-actions":
+        return []
+
+    lines = [
+        f"github_run: {_download_run_text(download)}",
+        f"download_repo: {_download_repo_text(download)}",
+        f"download_dir: {download.get('download_dir') or 'unknown'}",
+    ]
+    if "download_dir_retained" in download:
+        lines.append(f"download_dir_retained: {_artifact_value_text(download.get('download_dir_retained'))}")
+    artifact_filter_source = download.get("artifact_filter_source")
+    if artifact_filter_source is not None:
+        lines.append(f"artifact_filter_source: {artifact_filter_source}")
+
+    artifact_names = download.get("artifact_names")
+    if isinstance(artifact_names, list) and artifact_names:
+        lines.append(f"artifact_names: {', '.join(str(name) for name in artifact_names)}")
+
+    artifact_patterns = download.get("artifact_patterns")
+    if isinstance(artifact_patterns, list) and artifact_patterns:
+        lines.append(f"artifact_patterns: {', '.join(str(pattern) for pattern in artifact_patterns)}")
+
+    for key in (
+        "resolved_artifact_count",
+        "resolved_filesystem_artifact_count",
+        "resolved_archive_member_count",
+    ):
+        if key in download:
+            lines.append(f"{key}: {_artifact_value_text(download.get(key))}")
+
+    run_lookup = download.get("run_lookup")
+    if isinstance(run_lookup, dict):
+        selected_run = run_lookup.get("selected_run")
+        if isinstance(selected_run, dict):
+            for source_key, target_key in (
+                ("workflow_name", "selected_github_run_workflow"),
+                ("status", "selected_github_run_status"),
+                ("conclusion", "selected_github_run_conclusion"),
+                ("head_branch", "selected_github_run_head_branch"),
+                ("event", "selected_github_run_event"),
+                ("display_title", "selected_github_run_title"),
+                ("url", "selected_github_run_url"),
+            ):
+                value = selected_run.get(source_key)
+                if value is not None and str(value):
+                    lines.append(f"{target_key}: {value}")
+
+    resolved_artifact_paths = download.get("resolved_artifact_paths")
+    if isinstance(resolved_artifact_paths, list):
+        for index, artifact_path in enumerate(resolved_artifact_paths, start=1):
+            lines.append(f"resolved_artifact[{index}]: {artifact_path}")
+
+    return lines
+
+
 def _expected_strategy_families_text(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         rendered = ", ".join(str(item) for item in value if item is not None and str(item))
@@ -318,14 +385,7 @@ def _format_packaging_baseline_text(report_payload: dict[str, Any]) -> str:
     requested_project_root = report_payload.get("requested_project_root")
     if requested_project_root is not None:
         lines.append(f"requested_project_root: {requested_project_root}")
-    if download.get("provider") == "github-actions":
-        lines.extend(
-            [
-                f"github_run: {download.get('run_id') or 'unknown'}",
-                f"download_repo: {_download_repo_text(download)}",
-                f"download_dir: {download.get('download_dir') or 'unknown'}",
-            ]
-        )
+    lines.extend(_github_run_download_lines(download))
     lines.extend(
         [
             "",
@@ -385,14 +445,7 @@ def _format_packaging_baseline_aggregate_text(report_payload: dict[str, Any]) ->
             f"{_artifact_value_text(summary.get('all_baseline_contracts_ok'))}"
         ),
     ]
-    if download.get("provider") == "github-actions":
-        lines.extend(
-            [
-                f"github_run: {download.get('run_id') or 'unknown'}",
-                f"download_repo: {_download_repo_text(download)}",
-                f"download_dir: {download.get('download_dir') or 'unknown'}",
-            ]
-        )
+    lines.extend(_github_run_download_lines(download))
     warnings = report_payload.get("warnings")
     if isinstance(warnings, list) and warnings:
         for index, warning in enumerate(warnings, start=1):
@@ -1143,6 +1196,8 @@ def _packaging_baseline_report(args: argparse.Namespace) -> int:
             report_payload = packaging_report.read_packaging_baseline_reports_from_github_run(
                 args.github_run,
                 repo=args.repo,
+                github_workflow=args.github_workflow,
+                github_run_list_limit=args.github_run_list_limit,
                 artifact_names=args.artifact_names,
                 artifact_patterns=args.artifact_patterns,
                 download_dir=args.download_dir,
@@ -1165,16 +1220,71 @@ def _packaging_baseline_report(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(dump_json(report_payload))
     else:
-        if report_payload.get("report_type") == "aggregate":
-            print(_format_packaging_baseline_aggregate_text(report_payload))
-        else:
-            print(_format_packaging_baseline_text(report_payload))
+        print(packaging_report.format_packaging_baseline_report_text(report_payload))
     if getattr(args, "require_contract_ok", False):
         failures = packaging_report.packaging_baseline_report_requirement_failures(report_payload)
         if failures:
             for failure in failures:
                 print(failure, file=sys.stderr)
             return 2
+    return 0
+
+
+def _packaging_baseline_verify(args: argparse.Namespace) -> int:
+    try:
+        if args.github_run:
+            payload = packaging_verify.verify_packaging_baseline_github_run(
+                args.github_run,
+                repo=args.repo,
+                github_workflow=args.github_workflow,
+                github_run_list_limit=args.github_run_list_limit,
+                artifact_names=args.artifact_names,
+                artifact_patterns=args.artifact_patterns,
+                download_dir=args.download_dir,
+                keep_download_dir=args.keep_download_dir,
+                output_dir=args.output_dir,
+                output_archive=args.output_archive,
+                archive_downloads=args.archive_downloads,
+                required_artifact_count=args.require_artifact_count,
+            )
+        else:
+            payload = packaging_verify.verify_packaging_baseline_artifacts(
+                args.paths,
+                output_dir=args.output_dir,
+                output_archive=args.output_archive,
+                archive_downloads=args.archive_downloads,
+                required_artifact_count=args.require_artifact_count,
+            )
+    except ResourceHunterError as exc:
+        payload = packaging_verify.build_packaging_baseline_verify_error_payload(
+            str(exc),
+            download_payload=getattr(exc, "download_payload", None),
+        )
+        if args.output_dir:
+            packaging_verify._persist_verify_outputs(
+                payload,
+                Path(args.output_dir),
+                output_archive=args.output_archive,
+                archive_downloads=args.archive_downloads,
+            )
+        if getattr(args, "json", False):
+            print(dump_json(payload))
+        else:
+            print(packaging_verify.format_packaging_baseline_verify_text(payload))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(dump_json(payload))
+    else:
+        print(packaging_verify.format_packaging_baseline_verify_text(payload))
+
+    if payload.get("gate_ok") is False:
+        gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else {}
+        failures = gate.get("failures") if isinstance(gate.get("failures"), list) else []
+        for failure in failures:
+            print(failure, file=sys.stderr)
+        return 2
     return 0
 
 
@@ -1490,7 +1600,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--github-run",
         help=(
             "download packaging-baseline artifacts from a GitHub Actions run with `gh run download` before reporting; "
+            "pass `latest` to auto-select the most recent completed resource-hunter-ci run; "
             "defaults to the resource-hunter-packaging-baseline-* artifact pattern"
+        ),
+    )
+    p_packaging_baseline_report.add_argument(
+        "--github-workflow",
+        help=(
+            "workflow name passed to `gh run list --workflow` when --github-run latest is used; "
+            f"defaults to {packaging_gate.DEFAULT_GITHUB_RUN_WORKFLOW}"
+        ),
+    )
+    p_packaging_baseline_report.add_argument(
+        "--github-run-list-limit",
+        type=packaging_gate._positive_int,
+        help=(
+            "max completed runs to scan when --github-run latest resolves a workflow-filtered run or "
+            f"artifact-discovery fallback; defaults to {packaging_gate._GITHUB_RUN_LIST_LIMIT}"
         ),
     )
     p_packaging_baseline_report.add_argument(
@@ -1520,6 +1646,101 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-download-dir",
         action="store_true",
         help="retain the temporary download directory created for --github-run reporting",
+    )
+
+    p_packaging_baseline_verify = sub.add_parser(
+        "packaging-baseline-verify",
+        help="Verify matched report/gate outputs from retained artifacts or one GitHub Actions run",
+    )
+    p_packaging_baseline_verify.add_argument(
+        "paths",
+        nargs="*",
+        help=(
+            "artifact file(s), .zip archive(s), or directories to scan recursively for packaging-baseline.json and nested .zip archives; "
+            "defaults to artifacts/packaging-baseline/packaging-baseline.json when --github-run is omitted"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--github-run",
+        help=(
+            "download packaging-baseline artifacts from a GitHub Actions run with `gh run download`; "
+            "pass `latest` to auto-select the most recent completed resource-hunter-ci run"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--github-workflow",
+        help=(
+            "workflow name passed to `gh run list --workflow` when --github-run latest is used; "
+            f"defaults to {packaging_gate.DEFAULT_GITHUB_RUN_WORKFLOW}"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--github-run-list-limit",
+        type=packaging_verify._positive_int,
+        help=(
+            "max completed runs to scan when --github-run latest resolves a workflow-filtered run or "
+            f"artifact-discovery fallback; defaults to {packaging_gate._GITHUB_RUN_LIST_LIMIT}"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--repo",
+        help=(
+            "repository passed through to `gh run download --repo`; defaults to GITHUB_REPOSITORY, "
+            "then the git origin remote, then the current gh repository context"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--artifact-name",
+        action="append",
+        dest="artifact_names",
+        help="artifact name to download from --github-run; may be passed multiple times",
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--artifact-pattern",
+        action="append",
+        dest="artifact_patterns",
+        help="artifact glob pattern to download from --github-run; may be passed multiple times",
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--download-dir",
+        help=(
+            "directory passed to `gh run download --dir`; defaults to <output-dir>/download when --output-dir is set, "
+            "otherwise a temporary directory"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--keep-download-dir",
+        action="store_true",
+        help="retain the temporary download directory created for verification when --download-dir is omitted",
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--output-dir",
+        help="write report.json, report.txt, gate.json, gate.txt, verify.json, and verify.txt into this directory",
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--output-archive",
+        help=(
+            "write a zip bundle containing the saved report.*, gate.*, verify.*, and bundle-manifest.json outputs; "
+            "requires --output-dir"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--archive-downloads",
+        action="store_true",
+        help=(
+            "include the retained downloaded artifact tree under download/ inside --output-archive; "
+            "requires --output-archive"
+        ),
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the top-level verification payload as JSON",
+    )
+    p_packaging_baseline_verify.add_argument(
+        "--require-artifact-count",
+        type=packaging_verify._positive_int,
+        help="require exactly N discovered packaging-baseline artifacts before verification passes",
     )
 
     p_video = sub.add_parser("video", help="Video workflow powered by yt-dlp")
@@ -1557,6 +1778,7 @@ def main(argv: list[str] | None = None) -> int:
         "packaging-capture",
         "packaging-baseline",
         "packaging-baseline-report",
+        "packaging-baseline-verify",
         "video",
     } and not argv[0].startswith("-"):
         argv = ["search"] + argv
@@ -1568,17 +1790,31 @@ def main(argv: list[str] | None = None) -> int:
         if args.github_run and args.paths:
             parser.error("paths cannot be combined with --github-run")
         if not args.github_run and (
-            args.repo or args.artifact_names or args.artifact_patterns or args.download_dir or args.keep_download_dir
+            args.github_workflow
+            or args.github_run_list_limit
+            or args.repo
+            or args.artifact_names
+            or args.artifact_patterns
+            or args.download_dir
+            or args.keep_download_dir
         ):
             parser.error(
-                "--repo, --artifact-name, --artifact-pattern, --download-dir, and --keep-download-dir require --github-run"
+                "--github-workflow, --github-run-list-limit, --repo, --artifact-name, --artifact-pattern, --download-dir, and --keep-download-dir require --github-run"
             )
+    if args.command == "packaging-baseline-verify":
+        packaging_verify.validate_packaging_baseline_verify_args(parser, args)
+    if args.command == "packaging-baseline-verify" and args.output_archive and not args.output_dir:
+        parser.error("--output-archive requires --output-dir")
+    if args.command == "packaging-baseline-verify" and args.archive_downloads and not args.output_archive:
+        parser.error("--archive-downloads requires --output-archive")
 
     try:
         if args.command == "packaging-smoke":
             return _packaging_smoke(args)
         if args.command == "packaging-baseline-report":
             return _packaging_baseline_report(args)
+        if args.command == "packaging-baseline-verify":
+            return _packaging_baseline_verify(args)
         cache = ResourceCache()
         engine = ResourceHunterEngine(cache=cache)
         if args.command == "search":

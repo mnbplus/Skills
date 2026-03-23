@@ -282,7 +282,52 @@ def _report_capture(
     packaging_python_auto_selected = capture.get("packaging_python_auto_selected")
     if packaging_python_auto_selected is not None:
         report_capture["packaging_python_auto_selected"] = packaging_python_auto_selected
+    diagnostics = _capture_diagnostics(capture)
+    if diagnostics:
+        report_capture["diagnostics"] = diagnostics
     return report_capture
+
+
+def _copy_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _capture_diagnostics(capture: Mapping[str, Any]) -> dict[str, Any]:
+    doctor = capture.get("doctor") if isinstance(capture.get("doctor"), Mapping) else {}
+    doctor_packaging = doctor.get("packaging") if isinstance(doctor.get("packaging"), Mapping) else {}
+    packaging_smoke = capture.get("packaging_smoke") if isinstance(capture.get("packaging_smoke"), Mapping) else {}
+    packaging_smoke_packaging = (
+        packaging_smoke.get("packaging") if isinstance(packaging_smoke.get("packaging"), Mapping) else {}
+    )
+
+    diagnostics: dict[str, Any] = {}
+    packaging_error = doctor_packaging.get("error") or packaging_smoke_packaging.get("error")
+    if packaging_error:
+        diagnostics["packaging_error"] = str(packaging_error)
+
+    blockers = _copy_string_list(doctor_packaging.get("blockers"))
+    if not blockers:
+        blockers = _copy_string_list(packaging_smoke_packaging.get("blockers"))
+    if blockers:
+        diagnostics["packaging_blockers"] = blockers
+
+    bootstrap_build_requirements = _copy_string_list(doctor_packaging.get("bootstrap_build_requirements"))
+    if bootstrap_build_requirements:
+        diagnostics["bootstrap_build_requirements"] = bootstrap_build_requirements
+
+    for key in ("bootstrap_build_deps_ready", "packaging_smoke_ready_with_bootstrap"):
+        value = doctor_packaging.get(key)
+        if value is not None:
+            diagnostics[key] = value
+
+    return diagnostics
 
 
 def build_packaging_baseline_report(payload: Mapping[str, Any], *, artifact_path: str | Path) -> dict[str, Any]:
@@ -335,6 +380,9 @@ def build_packaging_baseline_report(payload: Mapping[str, Any], *, artifact_path
     requested_project_root = payload.get("requested_project_root")
     if requested_project_root is not None:
         report_payload["requested_project_root"] = requested_project_root
+    capture_diagnostics = _packaging_baseline_report_capture_diagnostics(report_payload)
+    if capture_diagnostics:
+        report_payload["capture_diagnostics"] = capture_diagnostics
     return report_payload
 
 
@@ -394,7 +442,7 @@ def build_packaging_baseline_aggregate_report(report_payloads: Sequence[Mapping[
         warnings.extend(f"{artifact_path}: {warning}" for warning in artifact_warnings)
 
     artifact_count = len(artifact_reports)
-    return {
+    aggregate_report = {
         "report_schema_version": PACKAGING_BASELINE_REPORT_SCHEMA_VERSION,
         "report_type": "aggregate",
         "summary": {
@@ -410,6 +458,10 @@ def build_packaging_baseline_aggregate_report(report_payloads: Sequence[Mapping[
         "warnings": warnings,
         "artifacts": artifact_reports,
     }
+    capture_diagnostics = _packaging_baseline_report_capture_diagnostics(aggregate_report)
+    if capture_diagnostics:
+        aggregate_report["capture_diagnostics"] = capture_diagnostics
+    return aggregate_report
 
 
 def load_packaging_baseline_payload(path: str | Path) -> dict[str, Any]:
@@ -510,6 +562,8 @@ def read_packaging_baseline_reports_from_github_run(
     run_id: str,
     *,
     repo: str | None = None,
+    github_workflow: str | None = None,
+    github_run_list_limit: int | None = None,
     artifact_names: Sequence[str] | None = None,
     artifact_patterns: Sequence[str] | None = None,
     download_dir: str | Path | None = None,
@@ -522,6 +576,8 @@ def read_packaging_baseline_reports_from_github_run(
             download_payload = packaging_gate._download_packaging_baseline_github_run(
                 run_id,
                 repo=repo,
+                github_workflow=github_workflow,
+                github_run_list_limit=github_run_list_limit,
                 artifact_names=artifact_names,
                 artifact_patterns=artifact_patterns,
                 download_dir=download_dir,
@@ -541,6 +597,8 @@ def read_packaging_baseline_reports_from_github_run(
             download_payload = packaging_gate._download_packaging_baseline_github_run(
                 run_id,
                 repo=repo,
+                github_workflow=github_workflow,
+                github_run_list_limit=github_run_list_limit,
                 artifact_names=artifact_names,
                 artifact_patterns=artifact_patterns,
                 download_dir=retained_dir,
@@ -559,6 +617,8 @@ def read_packaging_baseline_reports_from_github_run(
             download_payload = packaging_gate._download_packaging_baseline_github_run(
                 run_id,
                 repo=repo,
+                github_workflow=github_workflow,
+                github_run_list_limit=github_run_list_limit,
                 artifact_names=artifact_names,
                 artifact_patterns=artifact_patterns,
                 download_dir=temp_dir,
@@ -600,6 +660,609 @@ def packaging_baseline_report_requirement_failures(report_payload: Mapping[str, 
     return [f"{artifact_path}: Packaging baseline contract drift detected."]
 
 
+def _capture_diagnostic_entry(
+    *,
+    artifact_path: str,
+    capture: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    diagnostics = capture.get("diagnostics") if isinstance(capture.get("diagnostics"), Mapping) else {}
+    actual = capture.get("actual") if isinstance(capture.get("actual"), Mapping) else {}
+
+    failed_step = actual.get("failed_step")
+    strategy_family = actual.get("strategy_family")
+    strategy = actual.get("strategy")
+    reason = actual.get("reason")
+    packaging_error = diagnostics.get("packaging_error")
+    packaging_blockers = _copy_string_list(diagnostics.get("packaging_blockers"))
+    bootstrap_build_requirements = _copy_string_list(diagnostics.get("bootstrap_build_requirements"))
+    bootstrap_build_deps_ready = diagnostics.get("bootstrap_build_deps_ready")
+    packaging_smoke_ready_with_bootstrap = diagnostics.get("packaging_smoke_ready_with_bootstrap")
+
+    if not any(
+        (
+            failed_step,
+            strategy_family,
+            strategy,
+            reason,
+            packaging_error,
+            packaging_blockers,
+            bootstrap_build_requirements,
+            bootstrap_build_deps_ready is not None,
+            packaging_smoke_ready_with_bootstrap is not None,
+        )
+    ):
+        return None
+
+    entry: dict[str, Any] = {
+        "artifact_path": artifact_path,
+        "artifact_label": _artifact_group_label(artifact_path),
+        "capture_name": str(capture.get("name") or "unknown"),
+        "capture_label": str(capture.get("label") or capture.get("name") or "unknown"),
+    }
+    packaging_python = capture.get("packaging_python")
+    if packaging_python is not None:
+        entry["packaging_python"] = packaging_python
+    if failed_step is not None:
+        entry["failed_step"] = failed_step
+    if strategy_family is not None:
+        entry["strategy_family"] = strategy_family
+    if strategy is not None:
+        entry["strategy"] = strategy
+    if reason is not None:
+        entry["reason"] = reason
+    if packaging_error:
+        entry["packaging_error"] = str(packaging_error)
+    if packaging_blockers:
+        entry["packaging_blockers"] = packaging_blockers
+    if bootstrap_build_requirements:
+        entry["bootstrap_build_requirements"] = bootstrap_build_requirements
+    if bootstrap_build_deps_ready is not None:
+        entry["bootstrap_build_deps_ready"] = bootstrap_build_deps_ready
+    if packaging_smoke_ready_with_bootstrap is not None:
+        entry["packaging_smoke_ready_with_bootstrap"] = packaging_smoke_ready_with_bootstrap
+    return entry
+
+
+def _packaging_baseline_report_capture_diagnostics(report_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    report_type = report_payload.get("report_type")
+    diagnostics: list[dict[str, Any]] = []
+
+    if report_type == "single":
+        artifact_path = str(report_payload.get("artifact_path") or "unknown artifact")
+        captures = report_payload.get("captures") if isinstance(report_payload.get("captures"), list) else []
+        for capture in captures:
+            if not isinstance(capture, Mapping) or capture.get("matches_expectation") is True:
+                continue
+            entry = _capture_diagnostic_entry(artifact_path=artifact_path, capture=capture)
+            if entry is not None:
+                diagnostics.append(entry)
+        return diagnostics
+
+    if report_type != "aggregate":
+        return diagnostics
+
+    artifacts = report_payload.get("artifacts") if isinstance(report_payload.get("artifacts"), list) else []
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        artifact_path = str(artifact.get("artifact_path") or "unknown artifact")
+        captures = artifact.get("captures") if isinstance(artifact.get("captures"), list) else []
+        for capture in captures:
+            if not isinstance(capture, Mapping) or capture.get("matches_expectation") is True:
+                continue
+            entry = _capture_diagnostic_entry(artifact_path=artifact_path, capture=capture)
+            if entry is not None:
+                diagnostics.append(entry)
+    return diagnostics
+
+
+def _artifact_group_label(artifact_path: object) -> str:
+    artifact_ref = str(artifact_path or "").strip()
+    if not artifact_ref:
+        return "unknown artifact"
+    archive_member_ref = _split_archive_member_path(artifact_ref)
+    if archive_member_ref is not None:
+        _, archive_member = archive_member_ref
+        member_path = Path(archive_member)
+        return member_path.parent.name or member_path.name or artifact_ref
+    artifact_path_obj = Path(artifact_ref)
+    return artifact_path_obj.parent.name or artifact_path_obj.name or artifact_ref
+
+
+def _requirement_failure_message(failure: object) -> str:
+    message = str(failure or "").strip()
+    prefix = "Packaging baseline requirement failed: "
+    if message.startswith(prefix):
+        return message[len(prefix) :]
+    return message
+
+
+def _aggregate_requirement_failure_groups(report_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if report_payload.get("report_type") != "aggregate":
+        return []
+    artifacts = report_payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        return []
+
+    grouped_failures: dict[str, dict[str, Any]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        requirements = artifact.get("requirements") if isinstance(artifact.get("requirements"), Mapping) else {}
+        requirement_failures = requirements.get("failures")
+        if not isinstance(requirement_failures, list):
+            continue
+        artifact_path = str(artifact.get("artifact_path") or "unknown artifact")
+        artifact_label = _artifact_group_label(artifact_path)
+        for failure in requirement_failures:
+            message = _requirement_failure_message(failure)
+            if not message:
+                continue
+            group = grouped_failures.setdefault(
+                message,
+                {
+                    "message": message,
+                    "artifact_labels": [],
+                    "artifact_paths": [],
+                },
+            )
+            if artifact_label not in group["artifact_labels"]:
+                group["artifact_labels"].append(artifact_label)
+            if artifact_path not in group["artifact_paths"]:
+                group["artifact_paths"].append(artifact_path)
+
+    summary: list[dict[str, Any]] = []
+    for group in grouped_failures.values():
+        summary.append(
+            {
+                "message": group["message"],
+                "artifact_count": len(group["artifact_paths"]),
+                "artifact_labels": list(group["artifact_labels"]),
+                "artifact_paths": list(group["artifact_paths"]),
+            }
+        )
+    return summary
+
+
+def _append_requirement_failure_group_lines(lines: list[str], report_payload: Mapping[str, Any]) -> None:
+    failure_groups = _aggregate_requirement_failure_groups(report_payload)
+    if not failure_groups:
+        return
+    lines.append("Requirement failure groups:")
+    for group in failure_groups:
+        artifact_count = int(group.get("artifact_count") or 0)
+        artifact_labels = group.get("artifact_labels") if isinstance(group.get("artifact_labels"), list) else []
+        artifact_label_text = ", ".join(str(label) for label in artifact_labels if str(label).strip()) or "unknown"
+        artifact_noun = "artifact" if artifact_count == 1 else "artifacts"
+        lines.append(
+            f"- {group.get('message')} ({artifact_count} {artifact_noun}: {artifact_label_text})"
+        )
+
+
+def _artifact_value_text(value: Any) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (list, tuple)):
+        rendered = ", ".join(_artifact_value_text(item) for item in value)
+        return rendered or "[]"
+    return str(value)
+
+
+def _diagnostic_summary_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return lines[-1]
+
+
+def _append_capture_diagnostic_lines(lines: list[str], report_payload: Mapping[str, Any]) -> None:
+    capture_diagnostics = _packaging_baseline_report_capture_diagnostics(report_payload)
+    if not capture_diagnostics:
+        return
+
+    lines.append("Drift diagnostics:")
+    for diagnostic in capture_diagnostics:
+        details: list[str] = []
+
+        failed_step = diagnostic.get("failed_step")
+        if failed_step is not None:
+            details.append(f"failed_step={failed_step}")
+
+        strategy_family = diagnostic.get("strategy_family")
+        if strategy_family is not None:
+            details.append(f"strategy_family={strategy_family}")
+
+        strategy = diagnostic.get("strategy")
+        if strategy is not None:
+            details.append(f"strategy={strategy}")
+
+        packaging_error = _diagnostic_summary_text(diagnostic.get("packaging_error"))
+        if packaging_error:
+            details.append(f"packaging_error={packaging_error}")
+        else:
+            reason = _diagnostic_summary_text(diagnostic.get("reason"))
+            if reason:
+                details.append(f"reason={reason}")
+
+        packaging_blockers = _copy_string_list(diagnostic.get("packaging_blockers"))
+        if packaging_blockers:
+            details.append(f"blockers={', '.join(packaging_blockers)}")
+
+        bootstrap_build_requirements = _copy_string_list(diagnostic.get("bootstrap_build_requirements"))
+        if bootstrap_build_requirements:
+            details.append(f"bootstrap_build_requirements={', '.join(bootstrap_build_requirements)}")
+
+        if diagnostic.get("bootstrap_build_deps_ready") is not None:
+            details.append(
+                "bootstrap_build_deps_ready="
+                f"{_artifact_value_text(diagnostic.get('bootstrap_build_deps_ready'))}"
+            )
+        if diagnostic.get("packaging_smoke_ready_with_bootstrap") is not None:
+            details.append(
+                "packaging_smoke_ready_with_bootstrap="
+                f"{_artifact_value_text(diagnostic.get('packaging_smoke_ready_with_bootstrap'))}"
+            )
+
+        summary = "; ".join(details) if details else "diagnostic details unavailable"
+        lines.append(
+            f"- {diagnostic.get('artifact_label') or 'unknown'} / "
+            f"{diagnostic.get('capture_label') or diagnostic.get('capture_name') or 'unknown'}: {summary}"
+        )
+
+
+def _download_repo_text(download: Mapping[str, Any]) -> str:
+    repo = download.get("repo")
+    if repo is None:
+        return "current gh context"
+    repo_label = str(repo)
+    repo_source = download.get("repo_source")
+    if repo_source:
+        repo_label = f"{repo_label} ({repo_source})"
+    return repo_label
+
+
+def _download_run_text(download: Mapping[str, Any]) -> str:
+    run_label = str(download.get("run_id") or "unknown")
+    requested_run_id = download.get("requested_run_id")
+    if requested_run_id is None:
+        return run_label
+    requested_run_label = str(requested_run_id).strip()
+    if requested_run_label and requested_run_label != run_label:
+        return f"{run_label} (requested {requested_run_label})"
+    return run_label
+
+
+def _github_run_download_lines(download: Mapping[str, Any]) -> list[str]:
+    if download.get("provider") != "github-actions":
+        return []
+
+    lines = [
+        f"github_run: {_download_run_text(download)}",
+        f"download_repo: {_download_repo_text(download)}",
+        f"download_dir: {download.get('download_dir') or 'unknown'}",
+    ]
+    if download.get("github_run_list_limit") is not None:
+        lines.append(f"github_run_list_limit: {_artifact_value_text(download.get('github_run_list_limit'))}")
+    if "download_dir_retained" in download:
+        lines.append(f"download_dir_retained: {_artifact_value_text(download.get('download_dir_retained'))}")
+    artifact_filter_source = download.get("artifact_filter_source")
+    if artifact_filter_source is not None:
+        lines.append(f"artifact_filter_source: {artifact_filter_source}")
+
+    artifact_names = download.get("artifact_names")
+    if isinstance(artifact_names, list) and artifact_names:
+        lines.append(f"artifact_names: {', '.join(str(name) for name in artifact_names)}")
+
+    artifact_patterns = download.get("artifact_patterns")
+    if isinstance(artifact_patterns, list) and artifact_patterns:
+        lines.append(f"artifact_patterns: {', '.join(str(pattern) for pattern in artifact_patterns)}")
+
+    for key in (
+        "resolved_artifact_count",
+        "resolved_filesystem_artifact_count",
+        "resolved_archive_member_count",
+    ):
+        if key in download:
+            lines.append(f"{key}: {_artifact_value_text(download.get(key))}")
+
+    run_lookup = download.get("run_lookup")
+    if isinstance(run_lookup, Mapping):
+        selected_run = run_lookup.get("selected_run")
+        if isinstance(selected_run, Mapping):
+            for source_key, target_key in (
+                ("workflow_name", "selected_github_run_workflow"),
+                ("status", "selected_github_run_status"),
+                ("conclusion", "selected_github_run_conclusion"),
+                ("head_branch", "selected_github_run_head_branch"),
+                ("event", "selected_github_run_event"),
+                ("display_title", "selected_github_run_title"),
+                ("url", "selected_github_run_url"),
+            ):
+                value = selected_run.get(source_key)
+                if value is not None and str(value):
+                    lines.append(f"{target_key}: {value}")
+
+    resolved_artifact_paths = download.get("resolved_artifact_paths")
+    if isinstance(resolved_artifact_paths, list):
+        for index, artifact_path in enumerate(resolved_artifact_paths, start=1):
+            lines.append(f"resolved_artifact[{index}]: {artifact_path}")
+
+    return lines
+
+
+def _expected_strategy_families_text(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        rendered = ", ".join(str(item) for item in value if item is not None and str(item))
+        if rendered:
+            return rendered
+    return "any"
+
+
+def _failed_step_text(failed_step: Any) -> str:
+    if failed_step is None:
+        return "absent"
+    return f"present ({failed_step})"
+
+
+def _format_packaging_baseline_issue(issue: Mapping[str, Any]) -> str:
+    parts = [
+        f"field={issue.get('field') or 'unknown'}",
+        f"kind={issue.get('kind') or 'unknown'}",
+    ]
+    if "expected_any_of" in issue:
+        parts.append(f"expected_any_of={_artifact_value_text(issue.get('expected_any_of'))}")
+    elif "expected_present" in issue:
+        parts.append(f"expected_present={_artifact_value_text(issue.get('expected_present'))}")
+    elif "expected" in issue:
+        parts.append(f"expected={_artifact_value_text(issue.get('expected'))}")
+    if "actual" in issue:
+        parts.append(f"actual={_artifact_value_text(issue.get('actual'))}")
+    message = issue.get("message")
+    if message:
+        parts.append(str(message))
+    return "; ".join(parts)
+
+
+def _packaging_baseline_report_capture_match(
+    report_payload: Mapping[str, Any],
+    *,
+    capture_name: str,
+) -> Any:
+    captures = report_payload.get("captures")
+    if not isinstance(captures, list):
+        return None
+    for capture in captures:
+        if not isinstance(capture, Mapping):
+            continue
+        if capture.get("name") == capture_name:
+            return capture.get("matches_expectation")
+    return None
+
+
+def _format_packaging_baseline_capture_text(capture: Mapping[str, Any]) -> list[str]:
+    label = capture.get("label") or f"{capture.get('name') or 'Unknown'}"
+    expected_outcome = capture.get("expected_outcome")
+    if not isinstance(expected_outcome, Mapping):
+        expected_outcome = {}
+    actual = capture.get("actual")
+    if not isinstance(actual, Mapping):
+        actual = {}
+    lines = [
+        f"{label} capture:",
+        f"- path: {capture.get('path') or 'missing'}",
+        f"- project_root: {capture.get('project_root') or 'missing'}",
+        f"- project_root_source: {capture.get('project_root_source') or 'unknown'}",
+    ]
+    requested_project_root = capture.get("requested_project_root")
+    if requested_project_root is not None:
+        lines.append(f"- requested_project_root: {requested_project_root}")
+    packaging_python = capture.get("packaging_python")
+    if packaging_python is not None:
+        lines.append(f"- packaging_python: {packaging_python}")
+    packaging_python_source = capture.get("packaging_python_source")
+    if packaging_python_source is not None:
+        lines.append(f"- packaging_python_source: {packaging_python_source}")
+    packaging_python_auto_selected = capture.get("packaging_python_auto_selected")
+    if packaging_python_auto_selected is not None:
+        lines.append(
+            f"- packaging_python_auto_selected: {_artifact_value_text(packaging_python_auto_selected)}"
+        )
+    lines.extend(
+        [
+            (
+                "- expected_outcome.doctor_packaging_ready: "
+                f"{_artifact_value_text(expected_outcome.get('doctor_packaging_ready'))}"
+            ),
+            (
+                "- actual.doctor_packaging_ready: "
+                f"{_artifact_value_text(actual.get('doctor_packaging_ready'))}"
+            ),
+            (
+                "- expected_outcome.packaging_smoke_ok: "
+                f"{_artifact_value_text(expected_outcome.get('packaging_smoke_ok'))}"
+            ),
+            f"- actual.packaging_smoke_ok: {_artifact_value_text(actual.get('packaging_smoke_ok'))}",
+            (
+                "- expected_outcome.failed_step_present: "
+                f"{_artifact_value_text(expected_outcome.get('failed_step_present'))}"
+            ),
+            f"- actual.failed_step: {_failed_step_text(actual.get('failed_step'))}",
+            (
+                "- expected_outcome.strategy_family_any_of: "
+                f"{_expected_strategy_families_text(expected_outcome.get('strategy_family_any_of'))}"
+            ),
+            f"- actual.strategy_family: {actual.get('strategy_family') or 'unknown'}",
+            f"- strategy: {actual.get('strategy') or 'unknown'}",
+            f"- reason: {actual.get('reason') or 'n/a'}",
+            f"- matches_expectation: {_artifact_value_text(capture.get('matches_expectation'))}",
+        ]
+    )
+    expectation_drift = capture.get("expectation_drift")
+    if isinstance(expectation_drift, list) and expectation_drift:
+        for index, issue in enumerate(expectation_drift, start=1):
+            if isinstance(issue, Mapping):
+                lines.append(f"- expectation_drift[{index}]: {_format_packaging_baseline_issue(issue)}")
+    else:
+        lines.append("- expectation_drift: none")
+    diagnostics = capture.get("diagnostics") if isinstance(capture.get("diagnostics"), Mapping) else {}
+    packaging_error = _diagnostic_summary_text(diagnostics.get("packaging_error"))
+    if packaging_error:
+        lines.append(f"- diagnostics.packaging_error: {packaging_error}")
+    packaging_blockers = _copy_string_list(diagnostics.get("packaging_blockers"))
+    if packaging_blockers:
+        lines.append(f"- diagnostics.packaging_blockers: {', '.join(packaging_blockers)}")
+    bootstrap_build_requirements = _copy_string_list(diagnostics.get("bootstrap_build_requirements"))
+    if bootstrap_build_requirements:
+        lines.append(
+            "- diagnostics.bootstrap_build_requirements: "
+            f"{', '.join(bootstrap_build_requirements)}"
+        )
+    if diagnostics.get("bootstrap_build_deps_ready") is not None:
+        lines.append(
+            "- diagnostics.bootstrap_build_deps_ready: "
+            f"{_artifact_value_text(diagnostics.get('bootstrap_build_deps_ready'))}"
+        )
+    if diagnostics.get("packaging_smoke_ready_with_bootstrap") is not None:
+        lines.append(
+            "- diagnostics.packaging_smoke_ready_with_bootstrap: "
+            f"{_artifact_value_text(diagnostics.get('packaging_smoke_ready_with_bootstrap'))}"
+        )
+    return lines
+
+
+def _format_single_packaging_baseline_text(report_payload: Mapping[str, Any]) -> str:
+    summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), Mapping) else {}
+    requirements = report_payload.get("requirements") if isinstance(report_payload.get("requirements"), Mapping) else {}
+    download = report_payload.get("download") if isinstance(report_payload.get("download"), Mapping) else {}
+    lines = [
+        "Resource Hunter packaging baseline report",
+        f"artifact: {report_payload.get('artifact_path') or 'unknown'}",
+        f"schema_version: {report_payload.get('artifact_schema_version')}",
+        f"captured_at: {report_payload.get('captured_at') or 'unknown'}",
+        f"output_dir: {report_payload.get('output_dir') or 'unknown'}",
+        f"project_root: {report_payload.get('project_root') or 'unknown'}",
+        f"project_root_source: {report_payload.get('project_root_source') or 'unknown'}",
+        f"blocked_python: {report_payload.get('blocked_python') or 'unknown'}",
+    ]
+    requested_project_root = report_payload.get("requested_project_root")
+    if requested_project_root is not None:
+        lines.append(f"requested_project_root: {requested_project_root}")
+    lines.extend(_github_run_download_lines(download))
+    lines.extend(
+        [
+            "",
+            "Summary:",
+            (
+                "- passing_capture_matches_expectation: "
+                f"{_artifact_value_text(summary.get('passing_capture_matches_expectation'))}"
+            ),
+            (
+                "- blocked_capture_matches_expectation: "
+                f"{_artifact_value_text(summary.get('blocked_capture_matches_expectation'))}"
+            ),
+            f"- baseline_contract_ok: {_artifact_value_text(summary.get('baseline_contract_ok'))}",
+            f"- require_expected_outcomes: {_artifact_value_text(requirements.get('require_expected_outcomes'))}",
+            f"- requirements.ok: {_artifact_value_text(requirements.get('ok'))}",
+        ]
+    )
+    failures = requirements.get("failures")
+    if isinstance(failures, list) and failures:
+        for index, failure in enumerate(failures, start=1):
+            lines.append(f"- requirements.failure[{index}]: {failure}")
+    else:
+        lines.append("- requirements.failure: none")
+    warnings = report_payload.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        for index, warning in enumerate(warnings, start=1):
+            lines.append(f"- warning[{index}]: {warning}")
+    else:
+        lines.append("- warning: none")
+
+    captures = report_payload.get("captures")
+    if not isinstance(captures, list):
+        captures = []
+    for capture in captures:
+        if not isinstance(capture, Mapping):
+            continue
+        lines.append("")
+        lines.extend(_format_packaging_baseline_capture_text(capture))
+    _append_capture_diagnostic_lines(lines, report_payload)
+    return "\n".join(lines)
+
+
+def _format_aggregate_packaging_baseline_text(report_payload: Mapping[str, Any]) -> str:
+    summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), Mapping) else {}
+    download = report_payload.get("download") if isinstance(report_payload.get("download"), Mapping) else {}
+    lines = [
+        "Resource Hunter packaging baseline aggregate report",
+        f"artifact_count: {summary.get('artifact_count') or 0}",
+        f"contract_ok_artifact_count: {summary.get('contract_ok_artifact_count') or 0}",
+        f"contract_drift_artifact_count: {summary.get('contract_drift_artifact_count') or 0}",
+        f"requirement_failed_artifact_count: {summary.get('requirement_failed_artifact_count') or 0}",
+        f"warning_count: {summary.get('warning_count') or 0}",
+        f"all_baseline_contracts_ok: {_artifact_value_text(summary.get('all_baseline_contracts_ok'))}",
+    ]
+    lines.extend(_github_run_download_lines(download))
+    _append_requirement_failure_group_lines(lines, report_payload)
+    _append_capture_diagnostic_lines(lines, report_payload)
+    warnings = report_payload.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        for index, warning in enumerate(warnings, start=1):
+            lines.append(f"warning[{index}]: {warning}")
+    else:
+        lines.append("warning: none")
+
+    artifacts = report_payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        artifacts = []
+    for index, artifact in enumerate(artifacts, start=1):
+        if not isinstance(artifact, Mapping):
+            continue
+        artifact_summary = artifact.get("summary") if isinstance(artifact.get("summary"), Mapping) else {}
+        requirements = artifact.get("requirements") if isinstance(artifact.get("requirements"), Mapping) else {}
+        artifact_warnings = artifact.get("warnings")
+        if not isinstance(artifact_warnings, list):
+            artifact_warnings = []
+        lines.extend(
+            [
+                "",
+                f"Artifact {index}:",
+                f"- path: {artifact.get('artifact_path') or 'unknown'}",
+                f"- captured_at: {artifact.get('captured_at') or 'unknown'}",
+                f"- project_root: {artifact.get('project_root') or 'unknown'}",
+                f"- baseline_contract_ok: {_artifact_value_text(artifact_summary.get('baseline_contract_ok'))}",
+                (
+                    "- passing.matches_expectation: "
+                    f"{_artifact_value_text(_packaging_baseline_report_capture_match(artifact, capture_name='passing'))}"
+                ),
+                (
+                    "- blocked.matches_expectation: "
+                    f"{_artifact_value_text(_packaging_baseline_report_capture_match(artifact, capture_name='blocked'))}"
+                ),
+                f"- requirements.ok: {_artifact_value_text(requirements.get('ok'))}",
+            ]
+        )
+        if artifact_warnings:
+            for warning_index, warning in enumerate(artifact_warnings, start=1):
+                lines.append(f"- warning[{warning_index}]: {warning}")
+        else:
+            lines.append("- warning: none")
+    return "\n".join(lines)
+
+
+def format_packaging_baseline_report_text(report_payload: Mapping[str, Any]) -> str:
+    if report_payload.get("report_type") == "aggregate":
+        return _format_aggregate_packaging_baseline_text(report_payload)
+    return _format_single_packaging_baseline_text(report_payload)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     from .cli import main as cli_main
 
@@ -619,6 +1282,7 @@ __all__ = [
     "build_packaging_baseline_report_error_payload",
     "build_packaging_baseline_aggregate_report",
     "build_packaging_baseline_report",
+    "format_packaging_baseline_report_text",
     "load_packaging_baseline_payload",
     "main",
     "packaging_baseline_report_requirement_failures",

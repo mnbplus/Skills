@@ -464,3 +464,137 @@ def test_cli_packaging_baseline_report_rejects_paths_with_github_run():
         cli.main(["packaging-baseline-report", "--github-run", "123456", "artifacts/downloaded-gh-artifacts"])
 
     assert excinfo.value.code == 2
+
+
+def test_cli_packaging_baseline_report_text_includes_latest_run_resolution(capsys, monkeypatch, tmp_path):
+    download_dir = tmp_path / "downloaded-gh-artifacts"
+    run_list_limit = 35
+    commands: list[list[str]] = []
+    artifact_path = download_dir / "resource-hunter-packaging-baseline-ubuntu-latest-py3.12" / "packaging-baseline.json"
+
+    def fake_run_command(args, *, cwd, timeout=300):
+        commands.append(list(args))
+        if args[2] == "list":
+            return {
+                "command": list(args),
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": json.dumps(
+                    [
+                        {
+                            "databaseId": 987654,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "workflowName": packaging_gate.DEFAULT_GITHUB_RUN_WORKFLOW,
+                            "headBranch": "main",
+                            "event": "push",
+                            "url": "https://github.com/openclaw/resource-hunter/actions/runs/987654",
+                            "displayTitle": "Packaging baseline",
+                        },
+                        {
+                            "databaseId": 987653,
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "workflowName": packaging_gate.DEFAULT_GITHUB_RUN_WORKFLOW,
+                            "headBranch": "main",
+                            "event": "push",
+                            "url": "https://github.com/openclaw/resource-hunter/actions/runs/987653",
+                            "displayTitle": "Older packaging baseline",
+                        },
+                    ]
+                ),
+                "stderr": "",
+            }
+        if args[:2] == ["/fake/bin/gh", "api"]:
+            return {
+                "command": list(args),
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "artifacts": [
+                            {"name": "resource-hunter-packaging-baseline-ubuntu-latest-py3.12"}
+                        ]
+                    }
+                ),
+                "stderr": "",
+            }
+        if args[:3] == ["/fake/bin/gh", "run", "download"]:
+            _write_packaging_baseline_artifact(
+                download_dir,
+                "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+                baseline_contract_ok=True,
+            )
+            return {
+                "command": list(args),
+                "cwd": str(cwd),
+                "returncode": 0,
+                "stdout": "downloaded",
+                "stderr": "",
+            }
+        pytest.fail(f"Unexpected command: {args}")
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "openclaw/resource-hunter")
+    monkeypatch.setattr(packaging_gate.shutil, "which", lambda name: "/fake/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(packaging_gate, "_run_command", fake_run_command)
+
+    rc = cli.main(
+        [
+            "packaging-baseline-report",
+            "--github-run",
+            "latest",
+            "--github-run-list-limit",
+            str(run_list_limit),
+            "--download-dir",
+            str(download_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "github_run: 987654 (requested latest)" in captured.out
+    assert "download_repo: openclaw/resource-hunter (environment)" in captured.out
+    assert f"download_dir: {download_dir.resolve()}" in captured.out
+    assert f"github_run_list_limit: {run_list_limit}" in captured.out
+    assert "download_dir_retained: true" in captured.out
+    assert "artifact_filter_source: default" in captured.out
+    assert f"artifact_patterns: {packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN}" in captured.out
+    assert "resolved_artifact_count: 1" in captured.out
+    assert "resolved_filesystem_artifact_count: 1" in captured.out
+    assert "resolved_archive_member_count: 0" in captured.out
+    assert f"resolved_artifact[1]: {artifact_path.resolve()}" in captured.out
+    assert f"selected_github_run_workflow: {packaging_gate.DEFAULT_GITHUB_RUN_WORKFLOW}" in captured.out
+    assert "selected_github_run_status: completed" in captured.out
+    assert "selected_github_run_conclusion: success" in captured.out
+    assert "selected_github_run_head_branch: main" in captured.out
+    assert "selected_github_run_event: push" in captured.out
+    assert "selected_github_run_title: Packaging baseline" in captured.out
+    assert "selected_github_run_url: https://github.com/openclaw/resource-hunter/actions/runs/987654" in captured.out
+    assert commands == [
+        [
+            "/fake/bin/gh",
+            "run",
+            "list",
+            "--workflow",
+            packaging_gate.DEFAULT_GITHUB_RUN_WORKFLOW,
+            "--limit",
+            str(run_list_limit),
+            "--json",
+            "databaseId,status,conclusion,workflowName,headBranch,event,url,displayTitle",
+            "--repo",
+            "openclaw/resource-hunter",
+        ],
+        ["/fake/bin/gh", "api", "repos/openclaw/resource-hunter/actions/runs/987654/artifacts"],
+        [
+            "/fake/bin/gh",
+            "run",
+            "download",
+            "987654",
+            "--repo",
+            "openclaw/resource-hunter",
+            "--dir",
+            str(download_dir.resolve()),
+            "--pattern",
+            packaging_gate.DEFAULT_GITHUB_ARTIFACT_PATTERN,
+        ],
+    ]

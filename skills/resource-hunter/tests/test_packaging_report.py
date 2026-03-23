@@ -10,6 +10,7 @@ from resource_hunter.errors import ResourceHunterError
 from resource_hunter.packaging_report import (
     PACKAGING_BASELINE_REPORT_SCHEMA_VERSION,
     build_packaging_baseline_report,
+    format_packaging_baseline_report_text,
     load_packaging_baseline_payload,
     packaging_baseline_report_requirement_failures,
     read_packaging_baseline_report,
@@ -85,6 +86,53 @@ def _baseline_payload(tmp_path):
     }
 
 
+def _apply_passing_capture_probe_error_drift(payload, *, packaging_error: str):
+    payload["passing_capture"].update(
+        {
+            "doctor_packaging_ready": False,
+            "packaging_smoke_ok": False,
+            "strategy": "blocked",
+            "strategy_family": "blocked",
+            "reason": "Packaging smoke is blocked: Unable to inspect packaging modules.",
+            "failed_step": "packaging-status",
+            "matches_expectation": False,
+            "expectation_drift": [
+                {
+                    "capture": "passing",
+                    "field": "doctor_packaging_ready",
+                    "kind": "unexpected_false",
+                    "expected": True,
+                    "actual": False,
+                    "message": "Passing capture did not report doctor_packaging_ready=true.",
+                }
+            ],
+            "doctor": {
+                "packaging": {
+                    "error": packaging_error,
+                    "blockers": [],
+                    "bootstrap_build_deps_ready": False,
+                    "bootstrap_build_requirements": ["setuptools>=69", "wheel"],
+                    "packaging_smoke_ready_with_bootstrap": False,
+                }
+            },
+        }
+    )
+    payload["summary"] = {
+        "passing_capture_matches_expectation": False,
+        "blocked_capture_matches_expectation": True,
+        "baseline_contract_ok": False,
+    }
+    payload["warnings"] = ["Passing capture did not report doctor_packaging_ready=true."]
+    payload["requirements"] = {
+        "require_expected_outcomes": True,
+        "ok": False,
+        "failures": [
+            "Packaging baseline requirement failed: Passing capture did not report doctor_packaging_ready=true."
+        ],
+    }
+    return payload
+
+
 def _write_baseline_artifact(artifact_path, payload):
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -121,6 +169,48 @@ def test_build_packaging_baseline_report_normalizes_artifact(tmp_path):
         "reason": "Packaging smoke passed.",
     }
     assert report["captures"][1]["expected_outcome"]["strategy_family_any_of"] == ["blocked"]
+
+
+def test_build_packaging_baseline_report_preserves_capture_diagnostics(tmp_path):
+    payload = _apply_passing_capture_probe_error_drift(
+        _baseline_payload(tmp_path),
+        packaging_error=(
+            "Unable to inspect packaging modules via /opt/python/3.10/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py"
+        ),
+    )
+
+    report = build_packaging_baseline_report(payload, artifact_path=tmp_path / "packaging-baseline.json")
+
+    assert report["capture_diagnostics"] == [
+        {
+            "artifact_path": str((tmp_path / "packaging-baseline.json").resolve()),
+            "artifact_label": tmp_path.name,
+            "capture_name": "passing",
+            "capture_label": "Passing",
+            "packaging_python": sys.executable,
+            "failed_step": "packaging-status",
+            "strategy_family": "blocked",
+            "strategy": "blocked",
+            "reason": "Packaging smoke is blocked: Unable to inspect packaging modules.",
+            "packaging_error": (
+                "Unable to inspect packaging modules via /opt/python/3.10/bin/python: "
+                "Traceback ...\nAssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py"
+            ),
+            "bootstrap_build_requirements": ["setuptools>=69", "wheel"],
+            "bootstrap_build_deps_ready": False,
+            "packaging_smoke_ready_with_bootstrap": False,
+        }
+    ]
+    assert report["captures"][0]["diagnostics"] == {
+        "packaging_error": (
+            "Unable to inspect packaging modules via /opt/python/3.10/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py"
+        ),
+        "bootstrap_build_requirements": ["setuptools>=69", "wheel"],
+        "bootstrap_build_deps_ready": False,
+        "packaging_smoke_ready_with_bootstrap": False,
+    }
 
 
 def test_read_packaging_baseline_report_reads_archive_from_disk(tmp_path):
@@ -422,3 +512,92 @@ def test_read_packaging_baseline_reports_aggregates_zip_members(tmp_path):
     assert report["artifacts_with_requirement_failures"] == [
         f"{archive_path.resolve()}!/job-b/nested/packaging-baseline.json"
     ]
+
+
+def test_format_packaging_baseline_report_text_groups_repeated_requirement_failures(tmp_path):
+    artifact_root = tmp_path / "downloaded-gh-artifacts"
+    for artifact_name in (
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+    ):
+        drift_payload = _baseline_payload(tmp_path / artifact_name)
+        drift_payload["blocked_capture"]["matches_expectation"] = False
+        drift_payload["blocked_capture"]["expectation_drift"] = [
+            {
+                "capture": "blocked",
+                "field": "failed_step",
+                "kind": "missing_failed_step",
+                "expected_present": True,
+                "actual": None,
+                "message": "Blocked capture did not report failed_step.",
+            }
+        ]
+        drift_payload["summary"] = {
+            "passing_capture_matches_expectation": True,
+            "blocked_capture_matches_expectation": False,
+            "baseline_contract_ok": False,
+        }
+        drift_payload["warnings"] = ["Blocked capture did not report failed_step."]
+        drift_payload["requirements"] = {
+            "require_expected_outcomes": True,
+            "ok": False,
+            "failures": [
+                "Packaging baseline requirement failed: Blocked capture did not report failed_step."
+            ],
+        }
+        _write_baseline_artifact(
+            artifact_root / artifact_name / "packaging-baseline.json",
+            drift_payload,
+        )
+
+    report = read_packaging_baseline_reports([artifact_root])
+
+    text = format_packaging_baseline_report_text(report)
+
+    assert "Requirement failure groups:" in text
+    assert (
+        "- Blocked capture did not report failed_step. "
+        "(2 artifacts: resource-hunter-packaging-baseline-ubuntu-latest-py3.10, "
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.11)" in text
+    )
+
+
+def test_format_packaging_baseline_report_text_includes_drift_diagnostics(tmp_path):
+    artifact_root = tmp_path / "downloaded-gh-artifacts"
+    payload_310 = _apply_passing_capture_probe_error_drift(
+        _baseline_payload(tmp_path / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10"),
+        packaging_error=(
+            "Unable to inspect packaging modules via /opt/python/3.10/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py"
+        ),
+    )
+    payload_311 = _apply_passing_capture_probe_error_drift(
+        _baseline_payload(tmp_path / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11"),
+        packaging_error=(
+            "Unable to inspect packaging modules via /opt/python/3.11/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.11/lib/python3.11/distutils/core.py"
+        ),
+    )
+    _write_baseline_artifact(
+        artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10" / "packaging-baseline.json",
+        payload_310,
+    )
+    _write_baseline_artifact(
+        artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11" / "packaging-baseline.json",
+        payload_311,
+    )
+
+    report = read_packaging_baseline_reports([artifact_root])
+
+    text = format_packaging_baseline_report_text(report)
+
+    assert "Drift diagnostics:" in text
+    assert "resource-hunter-packaging-baseline-ubuntu-latest-py3.10 / Passing" in text
+    assert "failed_step=packaging-status" in text
+    assert "strategy_family=blocked" in text
+    assert (
+        "packaging_error=AssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py" in text
+    )
+    assert "bootstrap_build_requirements=setuptools>=69, wheel" in text
+    assert "bootstrap_build_deps_ready=false" in text
+    assert "packaging_smoke_ready_with_bootstrap=false" in text
