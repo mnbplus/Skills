@@ -1,13 +1,14 @@
-﻿# Status
+# Status
 
 - Date: 2026-03-23
-- Task note: continued the packaging-contract follow-up by teaching the CLI to consume archived baseline artifacts after CI uploads them.
-- Improvement shipped: `packaging-baseline-report` now accepts individual baseline files, multiple explicit paths, or directories that are scanned recursively for `packaging-baseline.json`, emits an aggregate text/JSON report when multiple artifacts are found, and can fail with `--require-contract-ok` after printing if any archived artifact drifts from the expected passing-vs-blocked contract.
+- Task note: fixed the remaining GitHub Actions packaging-test failures on branch `resource-hunter-ci-fix-20260323-1402` after run `23424246775` exposed hosted-toolcache `setuptools`/`distutils` probe drift on Python 3.10/3.11.
+- Improvement shipped: the packaging capability probe now falls back to a fresh subprocess when the current interpreter trips the hosted `setuptools._distutils_hack` assertion, so packaging smoke and wheel-install entrypoint tests keep checking real wheel and console-script behavior instead of failing on the probe itself.
 - Code changes:
-  - `skills/resource-hunter/src/resource_hunter/cli.py` now discovers `packaging-baseline.json` recursively under directory inputs, emits `report_type=aggregate` for multi-artifact reports, surfaces top-level contract counters and per-artifact warnings, and supports `--require-contract-ok` gating.
-  - `skills/resource-hunter/tests/test_packaging_report.py` adds regression coverage for single-artifact gating, directory aggregation, and empty-directory handling.
-  - `skills/resource-hunter/README.md`, `skills/resource-hunter/SKILL.md`, `skills/resource-hunter/references/usage.md`, and `skills/resource-hunter/references/architecture.md` now document the new aggregate consumer flow for downloaded CI artifacts.
-  - `.gitignore` now ignores local packaging/build outputs such as `skills/resource-hunter/build/`, `skills/resource-hunter/artifacts/packaging-baseline-local/`, and generated `*.egg-info/` directories so packaging work stays scoped.
+  - `skills/resource-hunter/src/resource_hunter/packaging_smoke.py` now keeps the fast in-process probe for normal cases, but transparently reruns the packaging-module probe in a clean subprocess when `setuptools.build_meta` resolution raises the hosted `distutils` assertion.
+  - `skills/resource-hunter/tests/test_packaging.py` now derives wheel-build readiness from `packaging_smoke.packaging_status(...)` instead of a fragile direct `importlib.util.find_spec("setuptools.build_meta")` call, and adds regression coverage for the current-interpreter subprocess fallback.
 - Validation:
-  - `E:/DevTools/python/python.exe -m pytest skills/resource-hunter/tests/test_packaging_report.py -q`
-- Saturation: repo is still not saturated; the next bottleneck is wiring downloaded CI artifacts into a downstream dashboard or release job that calls `packaging-baseline-report <artifact-root> --json --require-contract-ok`.
+  - `E:/DevTools/python/python.exe -m pytest tests/test_packaging.py -k 'test_run_packaging_smoke_reports_missing_project_root or test_packaging_status_falls_back_to_subprocess_for_current_python_distutils_assertion or test_resource_hunter_entrypoints_after_wheel_install' -q`
+  - `E:/DevTools/python/python.exe -m pytest tests/test_packaging.py -k 'packaging_status or run_packaging_smoke_reports_missing_project_root' -q`
+  - `E:/DevTools/python/python.exe -m pytest tests/test_runtime.py -k 'test_packaging_status_' -q`
+  - `E:/DevTools/python/Scripts/ruff.exe check src/resource_hunter/packaging_smoke.py tests/test_packaging.py`
+- Saturation: the targeted CI root cause is addressed locally; the next bottleneck is pushing the commit and confirming the GitHub-hosted 3.10/3.11 matrix reruns cleanly with the existing packaging report/gate workflow unchanged.

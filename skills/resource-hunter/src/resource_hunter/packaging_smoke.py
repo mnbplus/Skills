@@ -85,10 +85,7 @@ def _same_python(python_executable: str) -> bool:
     return os.path.normcase(os.path.abspath(python_executable)) == os.path.normcase(os.path.abspath(sys.executable))
 
 
-def _module_statuses(*, python_executable: str | None = None) -> dict[str, bool]:
-    if not python_executable or _same_python(python_executable):
-        return {module_name: module_available(module_name) for module_name in _PROBED_MODULES}
-
+def _module_statuses_via_subprocess(python_executable: str) -> dict[str, bool]:
     try:
         with tempfile.TemporaryDirectory(prefix="resource-hunter-module-probe-") as tmp_dir:
             probe_script = Path(tmp_dir) / "probe_packaging_modules.py"
@@ -110,6 +107,17 @@ def _module_statuses(*, python_executable: str | None = None) -> dict[str, bool]
         ) from exc
 
     return {module_name: bool(payload.get(module_name)) for module_name in _PROBED_MODULES}
+
+
+def _module_statuses(*, python_executable: str | None = None) -> dict[str, bool]:
+    interpreter = python_executable or sys.executable
+    if not python_executable or _same_python(python_executable):
+        try:
+            return {module_name: module_available(module_name) for module_name in _PROBED_MODULES}
+        except AssertionError:
+            return _module_statuses_via_subprocess(interpreter)
+
+    return _module_statuses_via_subprocess(interpreter)
 
 
 def _packaging_probe_error_status(error: str) -> dict[str, Any]:

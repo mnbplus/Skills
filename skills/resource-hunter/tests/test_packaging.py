@@ -99,14 +99,7 @@ def _supports_pip() -> bool:
 
 
 def _supports_wheel_build() -> bool:
-    try:
-        return (
-            _supports_pip()
-            and importlib.util.find_spec("setuptools.build_meta") is not None
-            and importlib.util.find_spec("wheel") is not None
-        )
-    except ModuleNotFoundError:
-        return False
+    return bool(packaging_smoke.packaging_status(python_executable=sys.executable).get("wheel_build_ready"))
 
 
 def _write_packaging_baseline_artifact(
@@ -542,6 +535,54 @@ def test_packaging_status_probes_target_python(monkeypatch):
     status = packaging_smoke.packaging_status(python_executable="/tmp/alt-python")
 
     assert recorded and recorded[0][0] == "/tmp/alt-python"
+    assert recorded[0][1] != "-c"
+    assert Path(recorded[0][1]).name == "probe_packaging_modules.py"
+    assert status == {
+        "pip": True,
+        "venv": False,
+        "setuptools_build_meta": True,
+        "wheel": True,
+        "wheel_build_ready": True,
+        "python_module_smoke_ready": True,
+        "console_script_smoke_ready": True,
+        "full_packaging_smoke_ready": True,
+        "blockers": [],
+        "optional_gaps": ["venv"],
+        "console_script_strategy": "prefix-install",
+    }
+
+
+def test_packaging_status_falls_back_to_subprocess_for_current_python_distutils_assertion(monkeypatch):
+    recorded: list[list[str]] = []
+
+    def fake_module_available(module_name: str) -> bool:
+        if module_name == "setuptools.build_meta":
+            raise AssertionError("stdlib distutils leaked into setuptools probe")
+        return module_name != "venv"
+
+    def fake_run_command(args, *, cwd, env=None, timeout=180):
+        recorded.append(args)
+        return {
+            "command": args,
+            "cwd": str(cwd),
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "pip": True,
+                    "venv": False,
+                    "setuptools.build_meta": True,
+                    "wheel": True,
+                }
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(packaging_smoke, "module_available", fake_module_available)
+    monkeypatch.setattr(packaging_smoke, "_run_command", fake_run_command)
+
+    status = packaging_smoke.packaging_status()
+
+    assert recorded and recorded[0][0] == sys.executable
     assert recorded[0][1] != "-c"
     assert Path(recorded[0][1]).name == "probe_packaging_modules.py"
     assert status == {

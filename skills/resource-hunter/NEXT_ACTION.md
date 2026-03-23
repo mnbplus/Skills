@@ -1,8 +1,8 @@
-﻿# Next Action
+# Next Action
 
-Wire a downstream consumer around the new aggregate baseline-report flow.
+Push the CI probe-fallback fix and rerun the hosted matrix.
 
-- Add a dashboard/release job that downloads the `resource-hunter-packaging-baseline-*` artifacts and runs `resource-hunter packaging-baseline-report <downloaded artifact root> --json --require-contract-ok`.
-- If a downstream job still archives standalone `doctor --json` or `packaging-smoke --json` output, pass an explicit `--project-root <requested path>` there as well for provenance consistency.
-- Verify the first green GitHub Actions run uploads all three JSON files for every OS+Python matrix cell, and confirm the aggregate report sees all of them from the downloaded artifact tree.
-- Keep `yt-dlp` installation deferred unless public video workflow validation becomes the next priority.
+- Push the new commit on `resource-hunter-ci-fix-20260323-1402` so GitHub Actions reruns the existing workflow against the hosted Python 3.10 and 3.11 jobs that failed in run `23424246775`.
+- Watch the `test` matrix plus the existing packaging baseline report and gate jobs to confirm the probe no longer trips on hosted `setuptools._distutils_hack` behavior.
+- If any hosted job still fails, capture the exact failing matrix cell and compare its installed `setuptools`/`pip` versions before changing the packaging workflow contract.
+- Keep the aggregate packaging report/gate flow unchanged unless a new post-push run shows a separate regression.
