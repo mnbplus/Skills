@@ -1,7 +1,7 @@
 {
   "name": "resource-hunter",
-  "version": "2.0.0",
-  "description": "Unified public resource hunter for pan links, torrents, magnets, and public video URLs. Supports dual text/JSON output, source health tracking, and yt-dlp workflows.",
+  "version": "2.1.0",
+  "description": "Unified public resource hunter for pan links, torrents, magnets, and public video URLs. Supports layered success-first retrieval, source health tracking, and yt-dlp workflows.",
   "author": "mnbplus",
   "license": "MIT-0",
   "tags": [

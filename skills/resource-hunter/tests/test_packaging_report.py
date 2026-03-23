@@ -133,6 +133,14 @@ def _apply_passing_capture_probe_error_drift(payload, *, packaging_error: str):
     return payload
 
 
+def _apply_passing_capture_legacy_reason_probe_error_drift(payload, *, packaging_error: str):
+    payload = _apply_passing_capture_probe_error_drift(payload, packaging_error=packaging_error)
+    payload["passing_capture"]["reason"] = f"Packaging smoke is blocked: {packaging_error}"
+    payload["passing_capture"].pop("doctor", None)
+    payload["passing_capture"].pop("packaging_smoke", None)
+    return payload
+
+
 def _write_baseline_artifact(artifact_path, payload):
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -158,6 +166,10 @@ def test_build_packaging_baseline_report_normalizes_artifact(tmp_path):
 
     assert report["report_schema_version"] == PACKAGING_BASELINE_REPORT_SCHEMA_VERSION
     assert report["report_type"] == "single"
+    assert report["artifact_name"] == tmp_path.name
+    assert report["status"] == "ok"
+    assert report["requirement_failure_count"] == 0
+    assert report["capture_diagnostic_count"] == 0
     assert report["summary"]["baseline_contract_ok"] is True
     assert [capture["name"] for capture in report["captures"]] == ["passing", "blocked"]
     assert report["captures"][0]["actual"] == {
@@ -182,10 +194,14 @@ def test_build_packaging_baseline_report_preserves_capture_diagnostics(tmp_path)
 
     report = build_packaging_baseline_report(payload, artifact_path=tmp_path / "packaging-baseline.json")
 
+    assert report["status"] == "drift"
+    assert report["requirement_failure_count"] == 1
+    assert report["capture_diagnostic_count"] == 1
     assert report["capture_diagnostics"] == [
         {
             "artifact_path": str((tmp_path / "packaging-baseline.json").resolve()),
             "artifact_label": tmp_path.name,
+            "artifact_display_label": tmp_path.name,
             "capture_name": "passing",
             "capture_label": "Passing",
             "packaging_python": sys.executable,
@@ -210,6 +226,38 @@ def test_build_packaging_baseline_report_preserves_capture_diagnostics(tmp_path)
         "bootstrap_build_requirements": ["setuptools>=69", "wheel"],
         "bootstrap_build_deps_ready": False,
         "packaging_smoke_ready_with_bootstrap": False,
+    }
+
+
+def test_build_packaging_baseline_report_infers_traceback_diagnostics_from_reason_only(tmp_path):
+    packaging_error = (
+        "Unable to inspect packaging modules via /opt/python/3.10/bin/python: "
+        "Traceback ...\nAssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py"
+    )
+    payload = _apply_passing_capture_legacy_reason_probe_error_drift(
+        _baseline_payload(tmp_path),
+        packaging_error=packaging_error,
+    )
+
+    report = build_packaging_baseline_report(payload, artifact_path=tmp_path / "packaging-baseline.json")
+
+    assert report["capture_diagnostics"] == [
+        {
+            "artifact_path": str((tmp_path / "packaging-baseline.json").resolve()),
+            "artifact_label": tmp_path.name,
+            "artifact_display_label": tmp_path.name,
+            "capture_name": "passing",
+            "capture_label": "Passing",
+            "packaging_python": sys.executable,
+            "failed_step": "packaging-status",
+            "strategy_family": "blocked",
+            "strategy": "blocked",
+            "reason": "Packaging smoke is blocked: Unable to inspect packaging modules.",
+            "packaging_error": packaging_error,
+        }
+    ]
+    assert report["captures"][0]["diagnostics"] == {
+        "packaging_error": packaging_error,
     }
 
 
@@ -388,6 +436,33 @@ def test_read_packaging_baseline_reports_aggregates_multiple_artifacts(tmp_path)
     }
     assert report["artifacts_with_contract_drift"] == [str(drift_path.resolve())]
     assert report["artifacts_with_requirement_failures"] == [str(drift_path.resolve())]
+    assert report["artifact_statuses"] == [
+        {
+            "artifact_path": str(passing_path.resolve()),
+            "artifact_name": "job-a",
+            "status": "ok",
+            "baseline_contract_ok": True,
+            "requirement_failure_count": 0,
+            "capture_diagnostic_count": 0,
+        },
+        {
+            "artifact_path": str(drift_path.resolve()),
+            "artifact_name": "nested",
+            "status": "drift",
+            "baseline_contract_ok": False,
+            "requirement_failure_count": 1,
+            "capture_diagnostic_count": 1,
+        },
+    ]
+    assert report["requirement_failure_groups"] == [
+        {
+            "message": "Blocked capture did not report failed_step.",
+            "artifact_count": 1,
+            "artifact_labels": ["nested"],
+            "artifact_display_labels": ["nested"],
+            "artifact_paths": [str(drift_path.resolve())],
+        }
+    ]
     assert report["warnings"] == [f"{drift_path.resolve()}: Blocked capture did not report failed_step."]
     assert [artifact["artifact_path"] for artifact in report["artifacts"]] == [
         str(passing_path.resolve()),
@@ -552,13 +627,17 @@ def test_format_packaging_baseline_report_text_groups_repeated_requirement_failu
 
     report = read_packaging_baseline_reports([artifact_root])
 
+    assert report["requirement_failure_groups"][0]["artifact_display_labels"] == [
+        "ubuntu-latest / py3.10",
+        "ubuntu-latest / py3.11",
+    ]
+
     text = format_packaging_baseline_report_text(report)
 
     assert "Requirement failure groups:" in text
     assert (
         "- Blocked capture did not report failed_step. "
-        "(2 artifacts: resource-hunter-packaging-baseline-ubuntu-latest-py3.10, "
-        "resource-hunter-packaging-baseline-ubuntu-latest-py3.11)" in text
+        "(2 artifacts: ubuntu-latest / py3.10, ubuntu-latest / py3.11)" in text
     )
 
 
@@ -589,10 +668,32 @@ def test_format_packaging_baseline_report_text_includes_drift_diagnostics(tmp_pa
 
     report = read_packaging_baseline_reports([artifact_root])
 
+    assert len(report["capture_diagnostic_groups"]) == 1
+    assert report["capture_diagnostic_groups"][0]["artifact_count"] == 2
+    assert report["capture_diagnostic_groups"][0]["artifact_labels"] == [
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+    ]
+    assert report["capture_diagnostic_groups"][0]["artifact_display_labels"] == [
+        "ubuntu-latest / py3.10",
+        "ubuntu-latest / py3.11",
+    ]
+    assert report["capture_diagnostic_groups"][0]["packaging_error_signature"] == "AssertionError: */distutils/core.py"
+    assert report["capture_diagnostic_groups"][0]["packaging_error_summary_count"] == 2
+
     text = format_packaging_baseline_report_text(report)
 
+    assert "Drift diagnostic groups:" in text
+    assert (
+        "- Passing: failed_step=packaging-status; strategy_family=blocked; strategy=blocked; "
+        "reason=Packaging smoke is blocked: Unable to inspect packaging modules.; "
+        "packaging_error=AssertionError: */distutils/core.py (2 variants); "
+        "bootstrap_build_requirements=setuptools>=69, wheel; bootstrap_build_deps_ready=false; "
+        "packaging_smoke_ready_with_bootstrap=false "
+        "(2 artifacts: ubuntu-latest / py3.10, ubuntu-latest / py3.11)" in text
+    )
     assert "Drift diagnostics:" in text
-    assert "resource-hunter-packaging-baseline-ubuntu-latest-py3.10 / Passing" in text
+    assert "ubuntu-latest / py3.10 / Passing" in text
     assert "failed_step=packaging-status" in text
     assert "strategy_family=blocked" in text
     assert (
@@ -601,3 +702,53 @@ def test_format_packaging_baseline_report_text_includes_drift_diagnostics(tmp_pa
     assert "bootstrap_build_requirements=setuptools>=69, wheel" in text
     assert "bootstrap_build_deps_ready=false" in text
     assert "packaging_smoke_ready_with_bootstrap=false" in text
+
+
+def test_format_packaging_baseline_report_text_groups_legacy_reason_only_drift_diagnostics(tmp_path):
+    artifact_root = tmp_path / "downloaded-gh-artifacts"
+    payload_310 = _apply_passing_capture_legacy_reason_probe_error_drift(
+        _baseline_payload(tmp_path / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10"),
+        packaging_error=(
+            "Unable to inspect packaging modules via /opt/python/3.10/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py"
+        ),
+    )
+    payload_311 = _apply_passing_capture_legacy_reason_probe_error_drift(
+        _baseline_payload(tmp_path / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11"),
+        packaging_error=(
+            "Unable to inspect packaging modules via /opt/python/3.11/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.11/lib/python3.11/distutils/core.py"
+        ),
+    )
+    _write_baseline_artifact(
+        artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10" / "packaging-baseline.json",
+        payload_310,
+    )
+    _write_baseline_artifact(
+        artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11" / "packaging-baseline.json",
+        payload_311,
+    )
+
+    report = read_packaging_baseline_reports([artifact_root])
+
+    assert len(report["capture_diagnostic_groups"]) == 1
+    assert report["capture_diagnostic_groups"][0]["artifact_count"] == 2
+    assert report["capture_diagnostic_groups"][0]["reason"] == (
+        "Packaging smoke is blocked: Unable to inspect packaging modules."
+    )
+    assert report["capture_diagnostic_groups"][0]["artifact_display_labels"] == [
+        "ubuntu-latest / py3.10",
+        "ubuntu-latest / py3.11",
+    ]
+    assert report["capture_diagnostic_groups"][0]["packaging_error_signature"] == "AssertionError: */distutils/core.py"
+    assert report["capture_diagnostic_groups"][0]["packaging_error_summary_count"] == 2
+
+    text = format_packaging_baseline_report_text(report)
+
+    assert "Drift diagnostic groups:" in text
+    assert (
+        "- Passing: failed_step=packaging-status; strategy_family=blocked; strategy=blocked; "
+        "reason=Packaging smoke is blocked: Unable to inspect packaging modules.; "
+        "packaging_error=AssertionError: */distutils/core.py (2 variants) "
+        "(2 artifacts: ubuntu-latest / py3.10, ubuntu-latest / py3.11)" in text
+    )

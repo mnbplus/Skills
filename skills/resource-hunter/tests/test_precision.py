@@ -116,6 +116,14 @@ def test_cli_text_limit_is_hard_contract(monkeypatch, capsys):
                 "match_bucket": "title_family_match",
                 "confidence": 0.7,
                 "source_degraded": False,
+                "validation_status": "validated",
+                "validation_signals": ["title-family alignment"],
+                "actionability": "direct",
+                "evidence_count": 1,
+                "corroboration_count": 0,
+                "corroborated_sources": ["2fun"],
+                "cluster_id": "abc123",
+                "supporting_results": [],
                 "raw": {},
             },
             {
@@ -136,12 +144,20 @@ def test_cli_text_limit_is_hard_contract(monkeypatch, capsys):
                 "match_bucket": "weak_context_match",
                 "confidence": 0.2,
                 "source_degraded": False,
+                "validation_status": "speculative",
+                "validation_signals": ["weak context only"],
+                "actionability": "speculative",
+                "evidence_count": 1,
+                "corroboration_count": 0,
+                "corroborated_sources": ["2fun"],
+                "cluster_id": "def456",
+                "supporting_results": [],
                 "raw": {},
             },
         ],
         "warnings": [],
         "source_status": [],
-        "meta": {"cached": False},
+        "meta": {"cached": False, "success_estimate": {"has_direct": True, "has_actionable": True, "has_clues": False}},
     }
 
     monkeypatch.setattr("resource_hunter.cli.ResourceHunterEngine.search", lambda *args, **kwargs: fake_response)
@@ -312,7 +328,26 @@ def test_alias_resolution_for_chinese_old_movie_drives_plan_and_confidence(monke
     assert any("Full of Colors 1982" in item for item in response["plan"]["torrent_queries"] + response["plan"]["pan_queries"])
     assert response["results"][0]["match_bucket"] == "weak_context_match"
     text = pc.format_search_text(response, max_results=3)
-    assert "No confident match" in text
+    assert "actionability=" in text
+    assert response["meta"]["success_estimate"]["has_actionable"] is True
+
+
+def test_the_merry_widow_1952_wrong_year_result_is_not_direct_validated(tmp_path):
+    intent = parse_intent("The Merry Widow 1952", explicit_kind="movie")
+    wrong_year = pc.score_result(
+        SearchResult(
+            channel="torrent",
+            source="tpb",
+            provider="magnet",
+            title="The Merry Widow 1934 720p WebDL X264",
+            link_or_magnet="magnet:?xt=urn:btih:abc",
+            share_id_or_info_hash="abc",
+            seeders=25,
+        ),
+        intent,
+    )
+    assert wrong_year.validation_status == "conflict"
+    assert wrong_year.actionability == "speculative"
 
 
 def test_default_degraded_source_recovers_after_probe_or_real_success(tmp_path):
@@ -392,3 +427,5 @@ def test_search_json_meta_includes_request_id_and_timings(tmp_path):
     assert response["meta"]["request_id"]
     assert response["meta"]["timings_ms"]["total"] >= 0
     assert "fetch" in response["meta"]["timings_ms"]
+    assert "best_direct_results" in response["meta"]
+    assert response["meta"]["success_estimate"]["has_actionable"] is True

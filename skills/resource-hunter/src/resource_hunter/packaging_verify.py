@@ -245,6 +245,7 @@ def build_packaging_baseline_verify_payload(
     gate_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
     report_failures = packaging_report.packaging_baseline_report_requirement_failures(report_payload)
+    gate_failures = _failure_messages(gate_payload.get("failures"))
     download_payload = _optional_copy_mapping(report_payload.get("download"))
     gate_ok = gate_payload.get("ok") is True
     payload: dict[str, Any] = {
@@ -256,6 +257,11 @@ def build_packaging_baseline_verify_payload(
         "report_failures": list(report_failures),
         "gate_ok": gate_ok,
         "gate_failure_count": int(gate_payload.get("failure_count") or 0),
+        "failure_overlap": _failure_overlap_payload(
+            report_failures,
+            gate_failures,
+            report_payload=report_payload,
+        ),
         "report": dict(report_payload),
         "gate": dict(gate_payload),
     }
@@ -290,6 +296,203 @@ def _saved_outputs_text(saved_outputs: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _failure_messages(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    messages: list[str] = []
+    seen: set[str] = set()
+    for failure in value:
+        message = str(failure or "").strip()
+        if not message or message in seen:
+            continue
+        seen.add(message)
+        messages.append(message)
+    return messages
+
+
+def _report_artifact_contexts(report_payload: Mapping[str, Any]) -> list[dict[str, str]]:
+    report_type = report_payload.get("report_type")
+    if report_type == "aggregate":
+        artifacts = report_payload.get("artifacts")
+        if not isinstance(artifacts, list):
+            return []
+    else:
+        artifacts = [report_payload]
+
+    contexts: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        annotated_artifact = packaging_report._annotated_artifact_report(artifact)
+        artifact_path = str(annotated_artifact.get("artifact_path") or "").strip()
+        if not artifact_path or artifact_path in seen_paths:
+            continue
+        seen_paths.add(artifact_path)
+        artifact_label = packaging_report._artifact_group_label(artifact_path)
+        artifact_display_label = str(
+            annotated_artifact.get("artifact_matrix_label")
+            or annotated_artifact.get("artifact_name")
+            or artifact_label
+        )
+        contexts.append(
+            {
+                "artifact_path": artifact_path,
+                "artifact_label": artifact_label,
+                "artifact_display_label": artifact_display_label,
+            }
+        )
+
+    return sorted(contexts, key=lambda context: len(context["artifact_path"]), reverse=True)
+
+
+def _failure_group_summary(
+    failures: Sequence[str],
+    *,
+    report_payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    artifact_contexts = _report_artifact_contexts(report_payload)
+    grouped_failures: dict[str, dict[str, Any]] = {}
+    summary: list[dict[str, Any]] = []
+
+    for failure in failures:
+        raw_failure = str(failure or "").strip()
+        if not raw_failure:
+            continue
+
+        failure_message = raw_failure
+        artifact_path: str | None = None
+        artifact_label: str | None = None
+        artifact_display_label: str | None = None
+        for context in artifact_contexts:
+            prefix = f"{context['artifact_path']}: "
+            if not raw_failure.startswith(prefix):
+                continue
+            artifact_path = context["artifact_path"]
+            artifact_label = context["artifact_label"]
+            artifact_display_label = context["artifact_display_label"]
+            failure_message = raw_failure[len(prefix) :].strip()
+            break
+
+        normalized_message = packaging_report._requirement_failure_message(failure_message) or failure_message
+        group = grouped_failures.get(normalized_message)
+        if group is None:
+            group = {
+                "message": normalized_message,
+                "failure_count": 0,
+                "raw_failures": [],
+                "artifact_count": 0,
+                "artifact_labels": [],
+                "artifact_display_labels": [],
+                "artifact_paths": [],
+            }
+            grouped_failures[normalized_message] = group
+            summary.append(group)
+
+        group["failure_count"] += 1
+        if raw_failure not in group["raw_failures"]:
+            group["raw_failures"].append(raw_failure)
+        if artifact_path is None:
+            continue
+        if artifact_label not in group["artifact_labels"]:
+            group["artifact_labels"].append(artifact_label)
+        if artifact_display_label not in group["artifact_display_labels"]:
+            group["artifact_display_labels"].append(artifact_display_label)
+        if artifact_path not in group["artifact_paths"]:
+            group["artifact_paths"].append(artifact_path)
+        group["artifact_count"] = len(group["artifact_paths"])
+
+    return summary
+
+
+def _failure_overlap_payload(
+    report_failures: Sequence[str],
+    gate_failures: Sequence[str],
+    *,
+    report_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    report_unique = _failure_messages(list(report_failures))
+    gate_unique = _failure_messages(list(gate_failures))
+    report_lookup = set(report_unique)
+    gate_lookup = set(gate_unique)
+    shared_failures = [failure for failure in report_unique if failure in gate_lookup]
+    report_only_failures = [failure for failure in report_unique if failure not in gate_lookup]
+    gate_only_failures = [failure for failure in gate_unique if failure not in report_lookup]
+    return {
+        "shared_failure_count": len(shared_failures),
+        "shared_failures": shared_failures,
+        "shared_failure_groups": _failure_group_summary(shared_failures, report_payload=report_payload),
+        "report_only_failure_count": len(report_only_failures),
+        "report_only_failures": report_only_failures,
+        "report_only_failure_groups": _failure_group_summary(
+            report_only_failures,
+            report_payload=report_payload,
+        ),
+        "gate_only_failure_count": len(gate_only_failures),
+        "gate_only_failures": gate_only_failures,
+        "gate_only_failure_groups": _failure_group_summary(
+            gate_only_failures,
+            report_payload=report_payload,
+        ),
+        "report_matches_gate": report_unique == gate_unique,
+    }
+
+
+def _failure_overlap_text(payload: Mapping[str, Any]) -> list[str]:
+    overlap = payload.get("failure_overlap") if isinstance(payload.get("failure_overlap"), Mapping) else None
+    report = payload.get("report") if isinstance(payload.get("report"), Mapping) else {}
+    if overlap is None:
+        report_failures = payload.get("report_failures")
+        gate = payload.get("gate") if isinstance(payload.get("gate"), Mapping) else {}
+        overlap = _failure_overlap_payload(
+            report_failures if isinstance(report_failures, list) else [],
+            gate.get("failures") if isinstance(gate.get("failures"), list) else [],
+            report_payload=report,
+        )
+
+    def _group_entries(group_key: str, fallback_key: str) -> list[dict[str, Any]]:
+        groups = overlap.get(group_key) if isinstance(overlap.get(group_key), list) else None
+        if groups is not None:
+            return [dict(group) for group in groups if isinstance(group, Mapping)]
+        failures = overlap.get(fallback_key) if isinstance(overlap.get(fallback_key), list) else []
+        return _failure_group_summary(failures, report_payload=report)
+
+    shared_groups = _group_entries("shared_failure_groups", "shared_failures")
+    report_only_groups = _group_entries("report_only_failure_groups", "report_only_failures")
+    gate_only_groups = _group_entries("gate_only_failure_groups", "gate_only_failures")
+    if not shared_groups and not report_only_groups and not gate_only_groups:
+        return []
+
+    lines = [
+        "Failure overlap: "
+        f"shared={int(overlap.get('shared_failure_count') or 0)}; "
+        f"report_only={int(overlap.get('report_only_failure_count') or 0)}; "
+        f"gate_only={int(overlap.get('gate_only_failure_count') or 0)}"
+    ]
+
+    def _append_group_lines(header: str, groups: Sequence[Mapping[str, Any]]) -> None:
+        if not groups:
+            return
+        lines.append(header)
+        for group in groups:
+            message = str(group.get("message") or "").strip()
+            if not message:
+                continue
+            artifact_labels = group.get("artifact_display_labels")
+            if isinstance(artifact_labels, list) and artifact_labels:
+                artifact_count = int(group.get("artifact_count") or len(artifact_labels))
+                artifact_suffix = "artifact" if artifact_count == 1 else "artifacts"
+                display_labels = ", ".join(str(label) for label in artifact_labels)
+                lines.append(f"- {message} ({artifact_count} {artifact_suffix}: {display_labels})")
+                continue
+            lines.append(f"- {message}")
+
+    _append_group_lines("Shared report/gate failures:", shared_groups)
+    _append_group_lines("Report-only failures:", report_only_groups)
+    _append_group_lines("Gate-only failures:", gate_only_groups)
+    return lines
+
+
 def format_packaging_baseline_verify_text(payload: Mapping[str, Any]) -> str:
     status = _verify_status(payload)
     lines = [
@@ -307,17 +510,11 @@ def format_packaging_baseline_verify_text(payload: Mapping[str, Any]) -> str:
         lines.append(f"Gate status: {'ok' if payload.get('gate_ok') else 'drift'}")
         lines.append(f"Gate failure count: {payload.get('gate_failure_count') or 0}")
     report = payload.get("report") if isinstance(payload.get("report"), Mapping) else {}
+    packaging_report._append_artifact_status_summary_lines(lines, report)
     packaging_report._append_requirement_failure_group_lines(lines, report)
+    packaging_report._append_capture_diagnostic_group_lines(lines, report)
     packaging_report._append_capture_diagnostic_lines(lines, report)
-    report_failures = payload.get("report_failures")
-    if isinstance(report_failures, list) and report_failures:
-        lines.append("Report failures:")
-        lines.extend(f"- {failure}" for failure in report_failures)
-    gate = payload.get("gate") if isinstance(payload.get("gate"), Mapping) else {}
-    gate_failures = gate.get("failures") if isinstance(gate.get("failures"), list) else []
-    if gate_failures:
-        lines.append("Gate failures:")
-        lines.extend(f"- {failure}" for failure in gate_failures)
+    lines.extend(_failure_overlap_text(payload))
     saved_outputs = payload.get("saved_outputs") if isinstance(payload.get("saved_outputs"), Mapping) else {}
     if saved_outputs:
         lines.extend(_saved_outputs_text(saved_outputs))

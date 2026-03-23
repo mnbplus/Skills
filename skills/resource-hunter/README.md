@@ -1,68 +1,123 @@
-﻿# Resource Hunter
+# Resource Hunter
 
 Installable Python package and OpenClaw/ClawHub skill for public pan, torrent, magnet, and public video URL discovery.
 
+## What it does now
+
+`resource-hunter` is currently in a success-first retrieval phase focused on real public-source usefulness inside `skills/resource-hunter`.
+
+### Currently integrated source expansion
+
+#### Structured pan and clue sources
+- `2fun`
+- `dalipan`
+- `hunhepan`
+- `pansou.vip`
+- `tieba`
+
+#### Structured torrent sources
+- `nyaa`
+- `animetosho`
+- `dmhy`
+- `eztv`
+- `tpb`
+- `torlock`
+- `yts`
+- `1337x`
+
+#### Indexed discovery fallback
+- `search-index:ddg`
+- `search-index:bing`
+- `search-index:brave`
+
+### Retrieval layers
+- `direct-structured-pan`
+- `direct-structured-torrent`
+- `community-clue`
+- `indexed-discovery`
+- `authenticated-connector` (reserved)
+
+## Important release notes
+
+- `AnimeTosho`, `DMHY`, `Torlock`, `DaliPan`, `search-index:bing`, and `search-index:brave` are now integrated in the runtime path
+- `search-index:bing` and `search-index:brave` are best-effort fallback discovery providers, not the same stability class as structured direct adapters
+- `DaliPan` currently exposes **structured clue records** from anonymous search, not guaranteed final share URLs
+  - anonymous search is confirmed
+  - anonymous detail/url resolution is still incomplete
+  - runtime currently emits `dalipan://provider/eu-token` placeholders and marks them as clue/follow-up style output
+
+## Validation snapshot
+
+- `E:/DevTools/python/python.exe -m pytest tests/test_intent.py tests/test_results.py tests/test_precision.py tests/test_source_expansion.py tests/test_cli.py tests/test_runtime.py -q`
+  - `95 passed, 1 skipped`
+- `E:/DevTools/python/Scripts/ruff.exe check src/resource_hunter/adapters.py src/resource_hunter/intent.py src/resource_hunter/engine.py src/resource_hunter/retrieval_layers.py src/resource_hunter/core.py src/resource_hunter/precision_core.py src/resource_hunter/common.py tests/test_source_expansion.py`
+  - `All checks passed!`
+
+## Main entrypoints
+
 - Standard entrypoints: `resource-hunter`, `python -m resource_hunter`
 - Source checkout wrappers: `scripts/hunt.py`, `scripts/packaging_report.py`, `scripts/packaging_gate.py`, `scripts/packaging_verify.py`
-- Quick runtime checks: `resource-hunter --version`, `resource-hunter doctor --json`, `resource-hunter doctor --json --require-packaging-ready`, `resource-hunter doctor --json --python /path/to/python --require-packaging-ready`, `resource-hunter doctor --json --python auto --require-packaging-ready`, `resource-hunter doctor --json --project-root /path/to/repo --python auto --bootstrap-build-deps --require-packaging-ready`, `resource-hunter packaging-smoke --json`, `resource-hunter packaging-smoke --json --bootstrap-build-deps`, `resource-hunter packaging-capture --project-root /path/to/repo --python auto --bootstrap-build-deps --output artifacts/packaging-capture.json`, `resource-hunter packaging-baseline --project-root /path/to/repo --python auto --bootstrap-build-deps --output-dir artifacts/packaging-baseline --require-expected-outcomes`, `resource-hunter packaging-baseline-report artifacts/packaging-baseline/packaging-baseline.json`, `resource-hunter-packaging-baseline-report artifacts/downloaded-gh-artifacts --json --require-contract-ok`, `resource-hunter-packaging-baseline-report --github-run 123456 --json --require-contract-ok`, `resource-hunter-packaging-baseline-report --github-run latest --github-run-list-limit 100 --require-contract-ok`, `resource-hunter-packaging-baseline-gate artifacts/downloaded-gh-artifacts --json --require-artifact-count 6`, `resource-hunter-packaging-baseline-gate --github-run 123456 --json --require-artifact-count 6`, `resource-hunter-packaging-baseline-gate --github-run latest --github-run-list-limit 100 --require-artifact-count 6`, `resource-hunter packaging-baseline-verify artifacts/downloaded-gh-artifacts --json --require-artifact-count 6`, `resource-hunter packaging-baseline-verify --github-run latest --github-run-list-limit 100 --output-dir artifacts/packaging-baseline-gh-verify --output-archive artifacts/packaging-baseline-gh-verify.zip --archive-downloads --require-artifact-count 6`, `resource-hunter-packaging-baseline-verify --github-run latest --github-run-list-limit 100 --output-dir artifacts/packaging-baseline-gh-verify --output-archive artifacts/packaging-baseline-gh-verify.zip --archive-downloads --require-artifact-count 6`
-- `doctor --json` reports packaging blockers, interpreter probe failures via `packaging.error`, the resolved checkout root via top-level `project_root` plus `packaging.project_root`, and the root provenance via top-level `project_root_source` plus `packaging.project_root_source` (`argument` for an explicit `--project-root`, `discovered` for cwd/upward-walk resolution). When `--project-root` is passed it also records the original requested path via top-level `requested_project_root` plus `packaging.requested_project_root`. It also reports the selected console-script smoke strategy alongside `pip`, `wheel`, `setuptools.build_meta`, and `venv`. Add `--python /path/to/python` to inspect another interpreter without switching shells, set `RESOURCE_HUNTER_PACKAGING_PYTHON=/path/to/python` so CI/ops can reuse the same target interpreter across commands, or use `--python auto` / `RESOURCE_HUNTER_PACKAGING_PYTHON=auto` to auto-select the first packaging-ready interpreter discoverable via the current interpreter, active envs, PATH, and the Windows `py` launcher. Add `--bootstrap-build-deps` when doctor should also accept an interpreter that can bootstrap this checkout's declared build requirements into a disposable overlay, and add `--project-root` when the target checkout is not under the current working directory.
-- `resource-hunter packaging-baseline-verify` and `resource-hunter-packaging-baseline-verify` can either reuse retained packaging-baseline files/directories/archives or download one GitHub Actions run once, then build the baseline report and gate from that shared artifact set and write `report.json`, `report.txt`, `gate.json`, `gate.txt`, `verify.json`, `verify.txt`, plus `bundle-manifest.json` into `--output-dir`. Add `--output-archive <path.zip>` when ops wants the same synchronized evidence zipped into one portable bundle, and add `--archive-downloads` when a `--github-run` download should also embed the retained downloaded artifact tree under `download/` for a self-contained handoff bundle. The synced text summaries now group repeated requirement failures by artifact label so offline triage can spot failing matrix legs faster. Use either entrypoint when ops needs matched text/JSON evidence from retained artifacts or from `--github-run latest` without risking the report and gate resolving different runs. Omit `--repo` to try `GITHUB_REPOSITORY`, then the checkout's git `origin`, then the current `gh` context; latest-run lookup keeps walking that inferred chain when an earlier repo returns a 404 or has no matching workflow, fixed numeric `--github-run <id>` downloads now reuse the same inferred repo fallback when an earlier repo context returns 404 / Not Found, and JSON diagnostics record latest-run selection under `download.run_lookup.*` plus numeric-run retry history under `download.download_attempts`. When the default `resource-hunter-ci` workflow name is missing, latest-run lookup also falls back to scanning the most recent 20 completed runs for artifacts that match the requested filters, and `--github-run-list-limit <N>` lets ops widen that scan window when the producing run is older. Add `--github-workflow <name>` if you want to pin a specific workflow name instead of using that discovery fallback.
-- `doctor --require-packaging-ready` preserves the normal doctor output but exits with code `2` when packaging smoke is blocked, which makes it suitable for CI or ops gates. Pair it with `--bootstrap-build-deps` when the selected interpreter has `pip` but is still missing only `setuptools.build_meta` and/or `wheel`.
-- `packaging-smoke --json` performs the actual wheel-build, install, `python -m resource_hunter`, and `resource-hunter` entrypoint smoke against the current checkout; it now reports `project_root`, `project_root_source`, `requested_project_root` when `--project-root` is passed, `packaging.project_root`, `packaging.project_root_source`, `packaging.requested_project_root`, `packaging_python`, `packaging_python_source`, stable route fields `strategy` plus `strategy_family`, `packaging.error`, `failed_step` even for preflight failures such as `packaging-status` or `packaging-gate`, and auto-discovery candidate details when `auto` is requested, so CI/ops logs show both which interpreter ran and whether the checkout root came from an explicit request or discovery before any build/install step. Add `--project-root` when packaging validation targets another checkout, and `--bootstrap-build-deps` to temporarily install the declared build requirements into a disposable overlay when the selected interpreter has `pip` but is still missing `setuptools.build_meta` and/or `wheel`; `--python auto --bootstrap-build-deps` now auto-selects bootstrap-capable interpreters against that explicit root too.
-- `packaging-capture` bundles one `doctor` payload plus one `packaging-smoke` payload into a single archival-oriented JSON artifact, mirrors the shared provenance fields (`requested_project_root`, `project_root`, `project_root_source`, `packaging_python`, `packaging_python_source`, `packaging_python_auto_selected`, `packaging_python_candidates`) plus top-level `failed_step`, and adds compact `summary` and `requirements` blocks so CI/ops capture jobs can archive both success and intentionally blocked baselines without stitching two commands together or scraping stderr. `summary` now includes both `strategy` and stable `strategy_family` so dashboards can distinguish usable vs blocked routes without understanding every concrete install path. The command always emits JSON, accepts `--output` to write the same bundle to disk, and still defaults to exit code `0` once the capture artifact is produced. Add `--require-packaging-ready` and/or `--require-smoke-ok` when a gate should fail with code `2` after writing the artifact if the nested doctor/smoke expectations are not met.
-- `packaging-baseline` builds on `packaging-capture` for local artifact refreshes: it writes `passing-packaging-capture.json`, `blocked-packaging-capture.json`, and `packaging-baseline.json` under `--output-dir` (default `artifacts/packaging-baseline`) so ops can refresh one passing bundle plus one intentionally blocked bundle in a single command. The roll-up mirrors each capture's `project_root`, `project_root_source`, `requested_project_root`, `doctor_packaging_ready`, `packaging_smoke_ok`, `strategy`, `strategy_family`, `reason`, and `failed_step`, now adds per-capture `expected_outcome`, `matches_expectation`, and machine-readable `expectation_drift` entries (including `strategy_mismatch` when the route family changes), and still exposes top-level `summary`, `warnings`, and `requirements` for lightweight consumers. `expected_outcome` records the baseline contract directly beside each capture, including the expected readiness booleans, whether `failed_step` should be present, and the allowed `strategy_family` values, so dashboards can render the contract without hardcoding it. `--require-expected-outcomes` exits with code `2` after writing artifacts when the passing capture does not stay in the usable route family (`strategy_family=usable`) or the blocked capture does not stay intentionally blocked (`strategy_family=blocked` plus a `failed_step`). The raw `strategy` value remains in the artifact for concrete route diagnostics. The `requirements` block records whether that gate was requested, whether it passed overall, and the exact failure strings emitted on stderr when it fails. By default the blocked capture uses a generated missing interpreter path, or you can force a specific path via `--blocked-python`.
-- `packaging-baseline-report` is the read-only companion for archived baseline artifacts. It now accepts individual `packaging-baseline.json` files, multiple explicit paths, `.zip` archives that contain one or more `packaging-baseline.json` members, or directories that are scanned recursively for `packaging-baseline.json` and nested `.zip` downloads so downloaded GitHub Actions matrix artifacts can be consumed without ad-hoc shell glue or a pre-extract step. Single-artifact input keeps the normalized `captures` report, while multi-artifact input emits an aggregate envelope with `report_type=aggregate`, per-artifact nested reports, top-level contract counts, and prefixed warnings. Zip-backed artifacts are surfaced as `archive.zip!/inner/path/packaging-baseline.json` so downstream logs stay source-addressable. Add `--json` when a downstream consumer wants machine-readable output, add `--require-contract-ok` when dashboards or release jobs should exit with code `2` after printing the report if any archived artifact shows packaging-baseline contract drift, or add `--github-run <run-id>` plus optional `--repo`, `--artifact-name`, `--artifact-pattern`, `--download-dir`, and `--keep-download-dir` when the report flow should fetch one Actions run directly via `gh run download` and record the download provenance in the emitted JSON. Passing `--github-run latest` now resolves the most recent completed `resource-hunter-ci` run first via `gh run list`, records the original selector under `download.requested_run_id`, and surfaces the selected run metadata in both JSON and text output. When `--repo` is omitted, the download path now tries `GITHUB_REPOSITORY`, then the checkout's git `origin`, and only then falls back to the current `gh` repository context. The `download` block now also records the resolved artifact count, concrete resolved artifact paths, a filesystem-vs-archive member split, and any inferred `repo_source` so real Actions bundles can be compared against local fake-`gh` runs without guessing which artifacts were actually consumed. Human-readable report output mirrors the same download diagnostics, including the resolved run, filter source, selected-run metadata, and resolved artifact paths. When `--json` is enabled, pre-report failures now emit a `report_type=error` payload on stdout as well so CI jobs can still archive structured diagnostics after a failed download or empty artifact bundle. Use the dedicated `resource-hunter-packaging-baseline-report` or `scripts/packaging_report.py` entrypoints when the caller wants the report flow without routing through the main CLI.
-- Python consumers can now reuse the same single-artifact normalization and multi-artifact aggregation without shelling out by calling `resource_hunter.packaging_report.read_packaging_baseline_report(path)`, `resource_hunter.packaging_report.read_packaging_baseline_reports(paths)`, or `resource_hunter.packaging_report.build_packaging_baseline_report(payload, artifact_path=...)`. For downstream jobs that only need a gate-ready summary, `resource_hunter.packaging_gate.evaluate_packaging_baseline_gate(paths)` now returns a versioned payload with `gate_schema_version`, `ok`, `failure_count`, `failures`, and the normalized summary block in one call. Jobs that download a fixed CI matrix can also pass `required_artifact_count` (or `--require-artifact-count` via `resource-hunter-packaging-baseline-gate`) so missing uploads fail the gate before a partial artifact set is treated as healthy. The same module now also exposes `evaluate_packaging_baseline_gate_from_github_run()` plus `--github-run` / `--repo` / `--artifact-name` / `--artifact-pattern` / `--download-dir`, so release jobs can download GitHub Actions artifacts with `gh run download` and gate them through the same summary payload without a separate shell wrapper. `--github-run latest` follows the same most-recent-completed `resource-hunter-ci` lookup flow as the report command, and when that default workflow name is missing it now scans recent completed runs for one whose artifacts match the requested filters before downloading. The text gate still echoes the resolved run plus selected-run metadata and resolved artifact counts/paths so release logs stay readable without `--json`. When `--json` is enabled, discovery/download failures now emit a non-empty `report_type=error` gate envelope on stdout too, so CI summary artifacts stay populated even when no baseline artifacts are found. The GitHub Actions workflow now runs both the read-only report and the stricter gate after downloading matrix artifacts, then uploads `resource-hunter-packaging-baseline-report-summary` alongside `resource-hunter-packaging-baseline-gate-summary` so downstream dashboards can archive both views from the same run. Installed environments expose the same flow as `resource-hunter-packaging-baseline-gate`, and source checkouts can run `python3 scripts/packaging_gate.py` without an editable install.
-- `resource_hunter.packaging_smoke.run_packaging_smoke()` now returns the same interpreter-provenance plus requested/resolved-project-root fields as the CLI path, including `project_root_source` and `strategy_family`, and accepts optional source/candidate overrides for env-driven or auto-selected callers
 - Legacy compatibility wrappers: `scripts/pansou.py`, `scripts/torrent.py`, `scripts/video.py`
-- Key regression samples: `Breaking Bad S01E01`, `Oppenheimer 2023`, `璧ゆ榛勭豢闈掕摑绱?1982`
 
-## Packaging probe errors
+## Common commands
 
-When `--python` points at a bad interpreter path, both JSON flows stay machine-readable instead of aborting. CI/ops consumers should key on `packaging.error`.
-
-`doctor --json --python /bad/path` keeps the normal doctor payload and surfaces the probe failure under `packaging.error`:
-
-```json
-{
-  "project_root": "/path/to/repo",
-  "project_root_source": "discovered",
-  "packaging_python": "/bad/path",
-  "packaging_python_source": "argument",
-  "packaging": {
-    "project_root": "/path/to/repo",
-    "project_root_source": "discovered",
-    "pip": null,
-    "venv": null,
-    "setuptools_build_meta": null,
-    "wheel": null,
-    "console_script_strategy": "blocked",
-    "error": "Unable to inspect packaging modules via /bad/path: <launcher error>"
-  },
-  "advice": [
-    "/bad/path (via --python) could not be inspected for packaging readiness: Unable to inspect packaging modules via /bad/path: <launcher error>. Check the interpreter path or pass a working Python via --python."
-  ]
-}
+```bash
+python3 scripts/hunt.py search "Oppenheimer 2023" --kind movie --4k
+python3 scripts/hunt.py search "Breaking Bad S01E01" --tv
+python3 scripts/hunt.py search "进击的巨人 Attack on Titan" --anime --sub
+python3 scripts/hunt.py search "周杰伦 无损" --music --quick
+python3 scripts/hunt.py search "Adobe Photoshop 2024" --software --json
+python3 scripts/hunt.py sources --probe --json
+python3 scripts/hunt.py doctor --json
+python3 scripts/hunt.py video probe "https://www.bilibili.com/video/BV..."
 ```
 
-`packaging-smoke --json --python /bad/path` returns a blocked payload instead of a generic crash; `reason` summarizes the failure and `packaging.error` preserves the original probe detail:
+## Search behavior summary
 
-```json
-{
-  "ok": false,
-  "strategy": "blocked",
-  "project_root": "/path/to/repo",
-  "project_root_source": "discovered",
-  "reason": "Packaging smoke is blocked: Unable to inspect packaging modules via /bad/path: <launcher error>",
-  "packaging_python": "/bad/path",
-  "packaging_python_source": "argument",
-  "packaging": {
-    "project_root": "/path/to/repo",
-    "project_root_source": "discovered",
-    "error": "Unable to inspect packaging modules via /bad/path: <launcher error>"
-  }
-}
+- Movie: pan first, torrents as supplement
+- TV: TV-capable torrents first, pan as supplement
+- Anime: `nyaa -> animetosho -> dmhy -> torlock` first, pan as supplement
+- Music/software/book/general: pan first
+- If direct retrieval is weak, indexed discovery may run through DDG/Bing/Brave
+
+## Result semantics
+
+Search results are ranked and validated into practical buckets:
+
+- `direct`
+- `actionable`
+- `clue`
+
+This distinction matters for current source coverage:
+
+- direct torrent sources often return immediately usable magnet results
+- public thread and indexed-discovery sources may return clue-like results
+- Dalipan is currently intentionally treated as a clue-style source in release semantics because final anonymous URL resolution is not yet complete
+
+## Current known limits
+
+- Public HTML/RSS sources may throttle, block, or change layout without notice
+- Indexed discovery may vary by region or anti-bot behavior
+- Same-title different-year film disambiguation is improved but still not perfect
+- `The Merry Widow 1952` remains a known hard live case
+- `PanSearch` has shown promising real payloads but is not yet integrated because content-card link extraction is still unfinished
+
+## Packaging / installability tooling
+
+Packaging, report, gate, and verify flows remain available for installability and CI workflows, for example:
+
+```bash
+python3 scripts/hunt.py doctor --json --require-packaging-ready
+python3 scripts/hunt.py packaging-smoke --json
+python3 scripts/hunt.py packaging-baseline --project-root /path/to/repo --python auto --bootstrap-build-deps --output-dir artifacts/packaging-baseline --require-expected-outcomes
+python3 scripts/hunt.py packaging-baseline-report artifacts/packaging-baseline/packaging-baseline.json
+python3 scripts/packaging_gate.py artifacts/downloaded-gh-artifacts --json
+python3 scripts/packaging_verify.py --github-run latest --output-dir artifacts/packaging-baseline-gh-verify --require-artifact-count 6
 ```
 
-See [SKILL.md](./SKILL.md) for skill-focused usage.
+## References
 
+- Skill-focused usage: [SKILL.md](./SKILL.md)
+- Detailed source matrix: [references/sources.md](./references/sources.md)
+- Internal architecture: [references/architecture.md](./references/architecture.md)
+- Usage notes: [references/usage.md](./references/usage.md)

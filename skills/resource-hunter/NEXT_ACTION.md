@@ -1,8 +1,21 @@
-﻿# Next Action
+# Next Action
 
-Land the `packaging-baseline-verify` follow-up, then generate one synced evidence bundle from the latest green CI run.
+Prepare and sync a source-expansion release of `resource-hunter` with clear capability boundaries.
 
-- Push the follow-up commit on `resource-hunter-ci-fix-20260323-1402` after review.
-- Run `python3 scripts/hunt.py packaging-baseline-verify --github-run latest --github-run-list-limit 100 --repo mnbplus/Skills --github-workflow resource-hunter-ci --output-dir <evidence-dir> --output-archive <evidence-zip> --archive-downloads --require-artifact-count 6 --json` against the published branch.
-- Review `verify.txt` and `report.txt` first to confirm the grouped failure summaries and bundle manifest line up with the hosted artifact set.
-- If verification drifts, use the grouped artifact labels to jump straight to the failing matrix legs and inspect their retained artifacts/logs.
+- Update release-facing docs so they match the current runtime:
+  - source matrix
+  - retrieval layers
+  - indexed-discovery fallback behavior
+  - Dalipan token-only limitation
+- Clean sync boundaries before publishing:
+  - exclude cache/build noise
+  - keep only meaningful live-test evidence
+  - avoid treating temporary probe scripts/pages as primary deliverables
+- Keep the release note honest:
+  - `AnimeTosho`, `DMHY`, `Torlock`, `DaliPan`, `search-index:bing`, and `search-index:brave` are now integrated
+  - `DaliPan` currently provides structured clue records from anonymous search, not guaranteed final share URLs
+  - `Bing` and `Brave` are best-effort indexed-discovery fallbacks
+- After sync, continue the next implementation wave in this order:
+  1. finish PanSearch content-card link extraction
+  2. revisit Dalipan detail/url completion and transport hardening
+  3. continue one-by-one probing for additional public no-API sources

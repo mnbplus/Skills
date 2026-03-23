@@ -163,6 +163,25 @@ def _write_packaging_baseline_artifact_with_passing_probe_error(
     return artifact_path
 
 
+def _write_packaging_baseline_artifact_with_legacy_passing_probe_error_reason(
+    root: Path,
+    artifact_name: str,
+    *,
+    packaging_error: str,
+) -> Path:
+    artifact_path = _write_packaging_baseline_artifact_with_passing_probe_error(
+        root,
+        artifact_name,
+        packaging_error=packaging_error,
+    )
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    payload["passing_capture"]["reason"] = f"Packaging smoke is blocked: {packaging_error}"
+    payload["passing_capture"].pop("doctor", None)
+    payload["passing_capture"].pop("packaging_smoke", None)
+    artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+    return artifact_path
+
+
 def test_packaging_baseline_verify_main_saves_outputs_from_latest_run(capsys, monkeypatch, tmp_path):
     output_dir = tmp_path / "verify-output"
     output_archive = tmp_path / "verify-bundle.zip"
@@ -705,6 +724,26 @@ def test_cli_packaging_baseline_verify_accepts_local_paths(capsys, tmp_path):
     assert (output_dir / "verify.json").is_file()
 
 
+def test_cli_packaging_baseline_verify_text_mode_keeps_gate_failures_out_of_stderr(capsys, tmp_path):
+    artifacts_root = tmp_path / "downloaded-artifacts"
+    _write_packaging_baseline_artifact(
+        artifacts_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=False,
+    )
+
+    rc = cli.main([
+        "packaging-baseline-verify",
+        str(artifacts_root),
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "Failure overlap: shared=1; report_only=0; gate_only=0" in captured.out
+    assert "Shared report/gate failures:" in captured.out
+    assert captured.err == ""
+
+
 def test_cli_packaging_baseline_verify_rejects_output_archive_without_output_dir():
     with pytest.raises(SystemExit) as excinfo:
         cli.main([
@@ -831,14 +870,199 @@ def test_format_packaging_baseline_verify_text_groups_repeated_requirement_failu
 
     payload = packaging_verify.verify_packaging_baseline_artifacts([artifact_root])
 
+    assert payload["report"]["artifact_statuses"] == [
+        {
+            "artifact_path": str(
+                (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10" / "packaging-baseline.json").resolve()
+            ),
+            "artifact_name": "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+            "artifact_matrix_os": "ubuntu-latest",
+            "artifact_matrix_python": "py3.10",
+            "artifact_matrix_label": "ubuntu-latest / py3.10",
+            "status": "drift",
+            "baseline_contract_ok": False,
+            "requirement_failure_count": 1,
+            "capture_diagnostic_count": 1,
+        },
+        {
+            "artifact_path": str(
+                (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11" / "packaging-baseline.json").resolve()
+            ),
+            "artifact_name": "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+            "artifact_matrix_os": "ubuntu-latest",
+            "artifact_matrix_python": "py3.11",
+            "artifact_matrix_label": "ubuntu-latest / py3.11",
+            "status": "drift",
+            "baseline_contract_ok": False,
+            "requirement_failure_count": 1,
+            "capture_diagnostic_count": 1,
+        },
+    ]
+    assert payload["report"]["requirement_failure_groups"] == [
+        {
+            "message": "Blocked capture did not report failed_step.",
+            "artifact_count": 2,
+            "artifact_labels": [
+                "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+                "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+            ],
+            "artifact_display_labels": [
+                "ubuntu-latest / py3.10",
+                "ubuntu-latest / py3.11",
+            ],
+            "artifact_paths": [
+                str(
+                    (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10" / "packaging-baseline.json").resolve()
+                ),
+                str(
+                    (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11" / "packaging-baseline.json").resolve()
+                ),
+            ],
+        }
+    ]
     text = packaging_verify.format_packaging_baseline_verify_text(payload)
 
+    assert "Artifact status summary:" in text
+    assert (
+        "- ubuntu-latest / py3.10: status=drift; baseline_contract_ok=false; "
+        "requirement_failures=1; capture_diagnostics=1" in text
+    )
+    assert (
+        "- ubuntu-latest / py3.11: status=drift; baseline_contract_ok=false; "
+        "requirement_failures=1; capture_diagnostics=1" in text
+    )
     assert "Requirement failure groups:" in text
     assert (
         "- Blocked capture did not report failed_step. "
-        "(2 artifacts: resource-hunter-packaging-baseline-ubuntu-latest-py3.10, "
-        "resource-hunter-packaging-baseline-ubuntu-latest-py3.11)" in text
+        "(2 artifacts: ubuntu-latest / py3.10, ubuntu-latest / py3.11)" in text
     )
+    assert payload["failure_overlap"]["shared_failure_count"] == 2
+    assert payload["failure_overlap"]["report_only_failure_count"] == 0
+    assert payload["failure_overlap"]["gate_only_failure_count"] == 0
+    assert payload["failure_overlap"]["report_matches_gate"] is True
+    assert payload["failure_overlap"]["shared_failure_groups"] == [
+        {
+            "message": "Blocked capture did not report failed_step.",
+            "failure_count": 2,
+            "raw_failures": [
+                str(
+                    (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10" / "packaging-baseline.json").resolve()
+                ) + ": Packaging baseline requirement failed: Blocked capture did not report failed_step.",
+                str(
+                    (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11" / "packaging-baseline.json").resolve()
+                ) + ": Packaging baseline requirement failed: Blocked capture did not report failed_step.",
+            ],
+            "artifact_count": 2,
+            "artifact_labels": [
+                "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+                "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+            ],
+            "artifact_display_labels": ["ubuntu-latest / py3.10", "ubuntu-latest / py3.11"],
+            "artifact_paths": [
+                str(
+                    (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10" / "packaging-baseline.json").resolve()
+                ),
+                str(
+                    (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11" / "packaging-baseline.json").resolve()
+                ),
+            ],
+        }
+    ]
+    assert "Failure overlap: shared=2; report_only=0; gate_only=0" in text
+    assert "Shared report/gate failures:" in text
+    assert (
+        "- Blocked capture did not report failed_step. "
+        "(2 artifacts: ubuntu-latest / py3.10, ubuntu-latest / py3.11)" in text
+    )
+    assert "Report failures:" not in text
+    assert "Gate failures:" not in text
+
+
+def test_build_packaging_baseline_verify_payload_tracks_failure_overlap():
+    shared_failure = "/tmp/shared/packaging-baseline.json: Packaging baseline requirement failed: drift"
+    report_only_failure = "/tmp/report-only/packaging-baseline.json: Packaging baseline requirement failed: drift"
+    gate_only_failure = "Expected 6 packaging-baseline artifacts but found 5."
+    payload = packaging_verify.build_packaging_baseline_verify_payload(
+        {
+            "report_type": "aggregate",
+            "artifacts": [
+                {
+                    "artifact_path": "/tmp/shared/packaging-baseline.json",
+                    "summary": {"baseline_contract_ok": False},
+                    "requirements": {
+                        "ok": False,
+                        "failures": ["Packaging baseline requirement failed: drift"],
+                    },
+                },
+                {
+                    "artifact_path": "/tmp/report-only/packaging-baseline.json",
+                    "summary": {"baseline_contract_ok": False},
+                    "requirements": {
+                        "ok": False,
+                        "failures": ["Packaging baseline requirement failed: drift"],
+                    },
+                },
+            ],
+        },
+        {
+            "ok": False,
+            "failure_count": 2,
+            "failures": [shared_failure, gate_only_failure],
+        },
+    )
+
+    assert payload["failure_overlap"]["shared_failure_count"] == 1
+    assert payload["failure_overlap"]["shared_failures"] == [shared_failure]
+    assert payload["failure_overlap"]["shared_failure_groups"] == [
+        {
+            "message": "drift",
+            "failure_count": 1,
+            "raw_failures": [shared_failure],
+            "artifact_count": 1,
+            "artifact_labels": ["shared"],
+            "artifact_display_labels": ["shared"],
+            "artifact_paths": ["/tmp/shared/packaging-baseline.json"],
+        }
+    ]
+    assert payload["failure_overlap"]["report_only_failure_count"] == 1
+    assert payload["failure_overlap"]["report_only_failures"] == [report_only_failure]
+    assert payload["failure_overlap"]["report_only_failure_groups"] == [
+        {
+            "message": "drift",
+            "failure_count": 1,
+            "raw_failures": [report_only_failure],
+            "artifact_count": 1,
+            "artifact_labels": ["report-only"],
+            "artifact_display_labels": ["report-only"],
+            "artifact_paths": ["/tmp/report-only/packaging-baseline.json"],
+        }
+    ]
+    assert payload["failure_overlap"]["gate_only_failure_count"] == 1
+    assert payload["failure_overlap"]["gate_only_failures"] == [gate_only_failure]
+    assert payload["failure_overlap"]["gate_only_failure_groups"] == [
+        {
+            "message": gate_only_failure,
+            "failure_count": 1,
+            "raw_failures": [gate_only_failure],
+            "artifact_count": 0,
+            "artifact_labels": [],
+            "artifact_display_labels": [],
+            "artifact_paths": [],
+        }
+    ]
+    assert payload["failure_overlap"]["report_matches_gate"] is False
+
+    text = packaging_verify.format_packaging_baseline_verify_text(payload)
+
+    assert "Failure overlap: shared=1; report_only=1; gate_only=1" in text
+    assert "Shared report/gate failures:" in text
+    assert "- drift (1 artifact: shared)" in text
+    assert "Report-only failures:" in text
+    assert "- drift (1 artifact: report-only)" in text
+    assert "Gate-only failures:" in text
+    assert gate_only_failure in text
+    assert "Report failures:" not in text
+    assert "Gate failures:" not in text
 
 
 def test_format_packaging_baseline_verify_text_includes_drift_diagnostics(tmp_path):
@@ -862,12 +1086,66 @@ def test_format_packaging_baseline_verify_text_includes_drift_diagnostics(tmp_pa
 
     payload = packaging_verify.verify_packaging_baseline_artifacts([artifact_root])
 
+    assert payload["report"]["artifact_statuses"] == [
+        {
+            "artifact_path": str(
+                (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.10" / "packaging-baseline.json").resolve()
+            ),
+            "artifact_name": "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+            "artifact_matrix_os": "ubuntu-latest",
+            "artifact_matrix_python": "py3.10",
+            "artifact_matrix_label": "ubuntu-latest / py3.10",
+            "status": "drift",
+            "baseline_contract_ok": False,
+            "requirement_failure_count": 1,
+            "capture_diagnostic_count": 1,
+        },
+        {
+            "artifact_path": str(
+                (artifact_root / "resource-hunter-packaging-baseline-ubuntu-latest-py3.11" / "packaging-baseline.json").resolve()
+            ),
+            "artifact_name": "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+            "artifact_matrix_os": "ubuntu-latest",
+            "artifact_matrix_python": "py3.11",
+            "artifact_matrix_label": "ubuntu-latest / py3.11",
+            "status": "drift",
+            "baseline_contract_ok": False,
+            "requirement_failure_count": 1,
+            "capture_diagnostic_count": 1,
+        },
+    ]
     assert len(payload["report"]["capture_diagnostics"]) == 2
+    assert len(payload["report"]["capture_diagnostic_groups"]) == 1
+    assert payload["report"]["capture_diagnostic_groups"][0]["artifact_count"] == 2
+    assert payload["report"]["capture_diagnostic_groups"][0]["artifact_labels"] == [
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+    ]
+    assert payload["report"]["capture_diagnostic_groups"][0]["artifact_display_labels"] == [
+        "ubuntu-latest / py3.10",
+        "ubuntu-latest / py3.11",
+    ]
+    assert payload["report"]["capture_diagnostic_groups"][0]["packaging_error_signature"] == "AssertionError: */distutils/core.py"
+    assert payload["report"]["capture_diagnostic_groups"][0]["packaging_error_summary_count"] == 2
 
     text = packaging_verify.format_packaging_baseline_verify_text(payload)
 
+    assert "Artifact status summary:" in text
+    assert (
+        "- ubuntu-latest / py3.10: status=drift; baseline_contract_ok=false; "
+        "requirement_failures=1; capture_diagnostics=1" in text
+    )
+    assert "Drift diagnostic groups:" in text
+    assert (
+        "- Passing: failed_step=packaging-status; strategy_family=blocked; strategy=blocked; "
+        "reason=Packaging smoke is blocked: Unable to inspect packaging modules.; "
+        "packaging_error=AssertionError: */distutils/core.py (2 variants); "
+        "bootstrap_build_requirements=setuptools>=69, wheel; bootstrap_build_deps_ready=false; "
+        "packaging_smoke_ready_with_bootstrap=false "
+        "(2 artifacts: ubuntu-latest / py3.10, ubuntu-latest / py3.11)" in text
+    )
     assert "Drift diagnostics:" in text
-    assert "resource-hunter-packaging-baseline-ubuntu-latest-py3.10 / Passing" in text
+    assert "ubuntu-latest / py3.10 / Passing" in text
     assert "failed_step=packaging-status" in text
     assert "strategy_family=blocked" in text
     assert (
@@ -876,3 +1154,49 @@ def test_format_packaging_baseline_verify_text_includes_drift_diagnostics(tmp_pa
     assert "bootstrap_build_requirements=setuptools>=69, wheel" in text
     assert "bootstrap_build_deps_ready=false" in text
     assert "packaging_smoke_ready_with_bootstrap=false" in text
+
+
+def test_format_packaging_baseline_verify_text_groups_legacy_reason_only_diagnostics(tmp_path):
+    artifact_root = tmp_path / "downloaded-artifacts"
+    _write_packaging_baseline_artifact_with_legacy_passing_probe_error_reason(
+        artifact_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.10",
+        packaging_error=(
+            "Unable to inspect packaging modules via /opt/python/3.10/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py"
+        ),
+    )
+    _write_packaging_baseline_artifact_with_legacy_passing_probe_error_reason(
+        artifact_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.11",
+        packaging_error=(
+            "Unable to inspect packaging modules via /opt/python/3.11/bin/python: "
+            "Traceback ...\nAssertionError: /opt/python/3.11/lib/python3.11/distutils/core.py"
+        ),
+    )
+
+    payload = packaging_verify.verify_packaging_baseline_artifacts([artifact_root])
+
+    assert len(payload["report"]["capture_diagnostic_groups"]) == 1
+    assert payload["report"]["capture_diagnostic_groups"][0]["reason"] == (
+        "Packaging smoke is blocked: Unable to inspect packaging modules."
+    )
+    assert payload["report"]["capture_diagnostic_groups"][0]["artifact_display_labels"] == [
+        "ubuntu-latest / py3.10",
+        "ubuntu-latest / py3.11",
+    ]
+    assert payload["report"]["capture_diagnostic_groups"][0]["packaging_error_signature"] == "AssertionError: */distutils/core.py"
+    assert payload["report"]["capture_diagnostic_groups"][0]["packaging_error_summary_count"] == 2
+
+    text = packaging_verify.format_packaging_baseline_verify_text(payload)
+
+    assert "Drift diagnostic groups:" in text
+    assert (
+        "- Passing: failed_step=packaging-status; strategy_family=blocked; strategy=blocked; "
+        "reason=Packaging smoke is blocked: Unable to inspect packaging modules.; "
+        "packaging_error=AssertionError: */distutils/core.py (2 variants) "
+        "(2 artifacts: ubuntu-latest / py3.10, ubuntu-latest / py3.11)" in text
+    )
+    assert (
+        "packaging_error=AssertionError: /opt/python/3.10/lib/python3.10/distutils/core.py" in text
+    )

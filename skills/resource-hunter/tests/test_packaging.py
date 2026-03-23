@@ -440,7 +440,7 @@ def test_run_packaging_smoke_bootstraps_missing_build_deps(monkeypatch, tmp_path
             }
         if args[1:4] == ["-m", "pip", "wheel"]:
             dist_dir = Path(args[args.index("--wheel-dir") + 1])
-            (dist_dir / "resource_hunter-2.0.0-py3-none-any.whl").write_text("wheel", encoding="utf-8")
+            (dist_dir / f"resource_hunter-{__version__}-py3-none-any.whl").write_text("wheel", encoding="utf-8")
             return {
                 "command": args,
                 "cwd": str(cwd),

@@ -37,6 +37,18 @@ class SearchIntent:
 
 
 @dataclass
+class QueryPlanEntry:
+    query: str
+    stage: str
+    reasons: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    confidence: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class SearchPlan:
     channels: list[str]
     pan_queries: list[str] = field(default_factory=list)
@@ -44,6 +56,10 @@ class SearchPlan:
     preferred_pan_sources: list[str] = field(default_factory=list)
     preferred_torrent_sources: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    pan_query_graph: list[QueryPlanEntry] = field(default_factory=list)
+    torrent_query_graph: list[QueryPlanEntry] = field(default_factory=list)
+    source_query_plan: dict[str, list[str]] = field(default_factory=dict)
+    query_budgets: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -86,6 +102,14 @@ class SearchResult:
     confidence: float = 0.0
     source_degraded: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
+    validation_status: str = "speculative"
+    validation_signals: list[str] = field(default_factory=list)
+    actionability: str = "speculative"
+    evidence_count: int = 1
+    corroboration_count: int = 0
+    corroborated_sources: list[str] = field(default_factory=list)
+    cluster_id: str = ""
+    supporting_results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +130,14 @@ class SearchResult:
             "match_bucket": self.match_bucket,
             "confidence": self.confidence,
             "source_degraded": self.source_degraded,
+            "validation_status": self.validation_status,
+            "validation_signals": list(self.validation_signals),
+            "actionability": self.actionability,
+            "evidence_count": self.evidence_count,
+            "corroboration_count": self.corroboration_count,
+            "corroborated_sources": list(self.corroborated_sources),
+            "cluster_id": self.cluster_id,
+            "supporting_results": list(self.supporting_results),
             "raw": self.raw,
         }
 

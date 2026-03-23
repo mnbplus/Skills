@@ -464,11 +464,15 @@ def extract_share_id(url: str, provider_hint: str = "") -> str:
 def source_priority(source_name: str) -> int:
     priorities = {
         "2fun": 1,
+        "dalipan": 1,
         "hunhepan": 2,
         "pansou.vip": 3,
         "tieba": 4,
         "nyaa": 1,
+        "animetosho": 1,
         "eztv": 1,
+        "dmhy": 2,
+        "torlock": 2,
         "tpb": 2,
         "yts": 2,
         "1337x": 3,

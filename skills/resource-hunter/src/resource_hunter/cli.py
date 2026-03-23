@@ -1280,10 +1280,11 @@ def _packaging_baseline_verify(args: argparse.Namespace) -> int:
         print(packaging_verify.format_packaging_baseline_verify_text(payload))
 
     if payload.get("gate_ok") is False:
-        gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else {}
-        failures = gate.get("failures") if isinstance(gate.get("failures"), list) else []
-        for failure in failures:
-            print(failure, file=sys.stderr)
+        if getattr(args, "json", False):
+            gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else {}
+            failures = gate.get("failures") if isinstance(gate.get("failures"), list) else []
+            for failure in failures:
+                print(failure, file=sys.stderr)
         return 2
     return 0
 

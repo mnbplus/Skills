@@ -309,6 +309,8 @@ def _capture_diagnostics(capture: Mapping[str, Any]) -> dict[str, Any]:
 
     diagnostics: dict[str, Any] = {}
     packaging_error = doctor_packaging.get("error") or packaging_smoke_packaging.get("error")
+    if not packaging_error:
+        packaging_error = _infer_packaging_error_from_reason(capture.get("reason"))
     if packaging_error:
         diagnostics["packaging_error"] = str(packaging_error)
 
@@ -328,6 +330,33 @@ def _capture_diagnostics(capture: Mapping[str, Any]) -> dict[str, Any]:
             diagnostics[key] = value
 
     return diagnostics
+
+
+def _infer_packaging_error_from_reason(reason: object) -> str | None:
+    reason_text = str(reason or "").strip()
+    if not reason_text or "Traceback" not in reason_text:
+        return None
+    prefix = "Packaging smoke is blocked: "
+    if reason_text.startswith(prefix):
+        return reason_text[len(prefix) :].strip() or None
+    return reason_text
+
+
+def _normalized_capture_reason(reason: object) -> str | None:
+    reason_text = str(reason or "").strip()
+    if not reason_text:
+        return None
+    if "Traceback" not in reason_text:
+        return reason_text
+
+    summary_prefix = reason_text.partition("Traceback")[0].rstrip(" :")
+    if " via " in summary_prefix:
+        summary_prefix = summary_prefix.partition(" via ")[0].rstrip(" :")
+    if not summary_prefix:
+        return reason_text
+    if summary_prefix.endswith((".", "!", "?")):
+        return summary_prefix
+    return f"{summary_prefix}."
 
 
 def build_packaging_baseline_report(payload: Mapping[str, Any], *, artifact_path: str | Path) -> dict[str, Any]:
@@ -377,12 +406,16 @@ def build_packaging_baseline_report(payload: Mapping[str, Any], *, artifact_path
             ),
         ],
     }
+    report_payload.update(_artifact_summary_metadata(resolved_path))
     requested_project_root = payload.get("requested_project_root")
     if requested_project_root is not None:
         report_payload["requested_project_root"] = requested_project_root
     capture_diagnostics = _packaging_baseline_report_capture_diagnostics(report_payload)
     if capture_diagnostics:
         report_payload["capture_diagnostics"] = capture_diagnostics
+    report_payload["status"] = _artifact_report_status(report_payload)
+    report_payload["requirement_failure_count"] = len(failures)
+    report_payload["capture_diagnostic_count"] = len(capture_diagnostics)
     return report_payload
 
 
@@ -419,7 +452,7 @@ def _attach_download_artifact_resolution(
 
 
 def build_packaging_baseline_aggregate_report(report_payloads: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    artifact_reports = [dict(report_payload) for report_payload in report_payloads]
+    artifact_reports = [_annotated_artifact_report(report_payload) for report_payload in report_payloads]
     contract_ok_artifact_count = 0
     contract_drift_artifacts: list[str] = []
     requirement_failed_artifacts: list[str] = []
@@ -458,9 +491,18 @@ def build_packaging_baseline_aggregate_report(report_payloads: Sequence[Mapping[
         "warnings": warnings,
         "artifacts": artifact_reports,
     }
+    artifact_statuses = _aggregate_artifact_statuses(artifact_reports)
+    if artifact_statuses:
+        aggregate_report["artifact_statuses"] = artifact_statuses
+    requirement_failure_groups = _aggregate_requirement_failure_groups(aggregate_report)
+    if requirement_failure_groups:
+        aggregate_report["requirement_failure_groups"] = requirement_failure_groups
     capture_diagnostics = _packaging_baseline_report_capture_diagnostics(aggregate_report)
     if capture_diagnostics:
         aggregate_report["capture_diagnostics"] = capture_diagnostics
+    capture_diagnostic_groups = _aggregate_capture_diagnostic_groups(aggregate_report)
+    if capture_diagnostic_groups:
+        aggregate_report["capture_diagnostic_groups"] = capture_diagnostic_groups
     return aggregate_report
 
 
@@ -671,7 +713,7 @@ def _capture_diagnostic_entry(
     failed_step = actual.get("failed_step")
     strategy_family = actual.get("strategy_family")
     strategy = actual.get("strategy")
-    reason = actual.get("reason")
+    reason = _normalized_capture_reason(actual.get("reason"))
     packaging_error = diagnostics.get("packaging_error")
     packaging_blockers = _copy_string_list(diagnostics.get("packaging_blockers"))
     bootstrap_build_requirements = _copy_string_list(diagnostics.get("bootstrap_build_requirements"))
@@ -696,6 +738,7 @@ def _capture_diagnostic_entry(
     entry: dict[str, Any] = {
         "artifact_path": artifact_path,
         "artifact_label": _artifact_group_label(artifact_path),
+        "artifact_display_label": _artifact_display_label(artifact_path),
         "capture_name": str(capture.get("name") or "unknown"),
         "capture_label": str(capture.get("label") or capture.get("name") or "unknown"),
     }
@@ -769,6 +812,71 @@ def _artifact_group_label(artifact_path: object) -> str:
     return artifact_path_obj.parent.name or artifact_path_obj.name or artifact_ref
 
 
+def _artifact_display_label(artifact_path: object) -> str:
+    metadata = _artifact_summary_metadata(artifact_path)
+    display_label = metadata.get("artifact_matrix_label") or metadata.get("artifact_name")
+    if display_label is not None and str(display_label).strip():
+        return str(display_label)
+    return _artifact_group_label(artifact_path)
+
+
+def _artifact_summary_metadata(artifact_path: object) -> dict[str, Any]:
+    artifact_name = _artifact_group_label(artifact_path)
+    metadata: dict[str, Any] = {
+        "artifact_name": artifact_name,
+    }
+    prefix = "resource-hunter-packaging-baseline-"
+    if not artifact_name.startswith(prefix):
+        return metadata
+    remainder = artifact_name[len(prefix) :]
+    matrix_os, separator, matrix_python_suffix = remainder.rpartition("-py")
+    if not separator or not matrix_os or not matrix_python_suffix:
+        return metadata
+    matrix_python = f"py{matrix_python_suffix}"
+    metadata.update(
+        {
+            "artifact_matrix_os": matrix_os,
+            "artifact_matrix_python": matrix_python,
+            "artifact_matrix_label": f"{matrix_os} / {matrix_python}",
+        }
+    )
+    return metadata
+
+
+def _artifact_report_status(report_payload: Mapping[str, Any]) -> str:
+    summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), Mapping) else {}
+    requirements = report_payload.get("requirements") if isinstance(report_payload.get("requirements"), Mapping) else {}
+    if summary.get("baseline_contract_ok") is True and requirements.get("ok") is not False:
+        return "ok"
+    return "drift"
+
+
+def _annotated_artifact_report(report_payload: Mapping[str, Any]) -> dict[str, Any]:
+    annotated = dict(report_payload)
+    artifact_path = annotated.get("artifact_path") or "unknown artifact"
+    for key, value in _artifact_summary_metadata(artifact_path).items():
+        annotated.setdefault(key, value)
+    capture_diagnostics = annotated.get("capture_diagnostics")
+    if not isinstance(capture_diagnostics, list):
+        capture_diagnostics = _packaging_baseline_report_capture_diagnostics(annotated)
+        if capture_diagnostics:
+            annotated["capture_diagnostics"] = capture_diagnostics
+    requirements = annotated.get("requirements") if isinstance(annotated.get("requirements"), Mapping) else {}
+    requirement_failures = requirements.get("failures") if isinstance(requirements.get("failures"), list) else []
+    annotated["status"] = str(annotated.get("status") or _artifact_report_status(annotated))
+    annotated["requirement_failure_count"] = int(
+        annotated.get("requirement_failure_count")
+        if annotated.get("requirement_failure_count") is not None
+        else len(requirement_failures)
+    )
+    annotated["capture_diagnostic_count"] = int(
+        annotated.get("capture_diagnostic_count")
+        if annotated.get("capture_diagnostic_count") is not None
+        else len(capture_diagnostics)
+    )
+    return annotated
+
+
 def _requirement_failure_message(failure: object) -> str:
     message = str(failure or "").strip()
     prefix = "Packaging baseline requirement failed: "
@@ -788,12 +896,22 @@ def _aggregate_requirement_failure_groups(report_payload: Mapping[str, Any]) -> 
     for artifact in artifacts:
         if not isinstance(artifact, Mapping):
             continue
-        requirements = artifact.get("requirements") if isinstance(artifact.get("requirements"), Mapping) else {}
+        annotated_artifact = _annotated_artifact_report(artifact)
+        requirements = (
+            annotated_artifact.get("requirements")
+            if isinstance(annotated_artifact.get("requirements"), Mapping)
+            else {}
+        )
         requirement_failures = requirements.get("failures")
         if not isinstance(requirement_failures, list):
             continue
-        artifact_path = str(artifact.get("artifact_path") or "unknown artifact")
+        artifact_path = str(annotated_artifact.get("artifact_path") or "unknown artifact")
         artifact_label = _artifact_group_label(artifact_path)
+        artifact_display_label = str(
+            annotated_artifact.get("artifact_matrix_label")
+            or annotated_artifact.get("artifact_name")
+            or artifact_label
+        )
         for failure in requirement_failures:
             message = _requirement_failure_message(failure)
             if not message:
@@ -803,11 +921,14 @@ def _aggregate_requirement_failure_groups(report_payload: Mapping[str, Any]) -> 
                 {
                     "message": message,
                     "artifact_labels": [],
+                    "artifact_display_labels": [],
                     "artifact_paths": [],
                 },
             )
             if artifact_label not in group["artifact_labels"]:
                 group["artifact_labels"].append(artifact_label)
+            if artifact_display_label not in group["artifact_display_labels"]:
+                group["artifact_display_labels"].append(artifact_display_label)
             if artifact_path not in group["artifact_paths"]:
                 group["artifact_paths"].append(artifact_path)
 
@@ -818,25 +939,98 @@ def _aggregate_requirement_failure_groups(report_payload: Mapping[str, Any]) -> 
                 "message": group["message"],
                 "artifact_count": len(group["artifact_paths"]),
                 "artifact_labels": list(group["artifact_labels"]),
+                "artifact_display_labels": list(group["artifact_display_labels"]),
                 "artifact_paths": list(group["artifact_paths"]),
             }
         )
     return summary
 
 
+def _aggregate_artifact_statuses(report_payload_or_artifacts: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(report_payload_or_artifacts, Mapping):
+        artifacts = report_payload_or_artifacts.get("artifacts")
+        if not isinstance(artifacts, list):
+            return []
+    else:
+        artifacts = report_payload_or_artifacts
+
+    statuses: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        annotated = _annotated_artifact_report(artifact)
+        summary_entry: dict[str, Any] = {
+            "artifact_path": str(annotated.get("artifact_path") or "unknown artifact"),
+            "artifact_name": str(annotated.get("artifact_name") or _artifact_group_label(annotated.get("artifact_path"))),
+            "status": str(annotated.get("status") or _artifact_report_status(annotated)),
+            "baseline_contract_ok": _packaging_baseline_report_summary_value(
+                annotated,
+                "baseline_contract_ok",
+            ),
+            "requirement_failure_count": int(annotated.get("requirement_failure_count") or 0),
+            "capture_diagnostic_count": int(annotated.get("capture_diagnostic_count") or 0),
+        }
+        for key in ("artifact_matrix_os", "artifact_matrix_python", "artifact_matrix_label"):
+            value = annotated.get(key)
+            if value is not None and str(value).strip():
+                summary_entry[key] = value
+        statuses.append(summary_entry)
+    return statuses
+
+
 def _append_requirement_failure_group_lines(lines: list[str], report_payload: Mapping[str, Any]) -> None:
-    failure_groups = _aggregate_requirement_failure_groups(report_payload)
+    failure_groups = report_payload.get("requirement_failure_groups")
+    if not isinstance(failure_groups, list):
+        failure_groups = _aggregate_requirement_failure_groups(report_payload)
     if not failure_groups:
         return
     lines.append("Requirement failure groups:")
     for group in failure_groups:
         artifact_count = int(group.get("artifact_count") or 0)
-        artifact_labels = group.get("artifact_labels") if isinstance(group.get("artifact_labels"), list) else []
+        artifact_labels = (
+            group.get("artifact_display_labels")
+            if isinstance(group.get("artifact_display_labels"), list)
+            else group.get("artifact_labels")
+            if isinstance(group.get("artifact_labels"), list)
+            else []
+        )
         artifact_label_text = ", ".join(str(label) for label in artifact_labels if str(label).strip()) or "unknown"
         artifact_noun = "artifact" if artifact_count == 1 else "artifacts"
         lines.append(
             f"- {group.get('message')} ({artifact_count} {artifact_noun}: {artifact_label_text})"
         )
+
+
+def _packaging_baseline_report_summary_value(report_payload: Mapping[str, Any], key: str) -> Any:
+    summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), Mapping) else {}
+    return summary.get(key)
+
+
+def _append_artifact_status_summary_lines(lines: list[str], report_payload: Mapping[str, Any]) -> None:
+    artifact_statuses = report_payload.get("artifact_statuses")
+    if not isinstance(artifact_statuses, list):
+        artifact_statuses = _aggregate_artifact_statuses(report_payload)
+    if not artifact_statuses:
+        return
+
+    lines.append("Artifact status summary:")
+    for artifact in artifact_statuses:
+        if not isinstance(artifact, Mapping):
+            continue
+        artifact_label = str(
+            artifact.get("artifact_matrix_label")
+            or artifact.get("artifact_name")
+            or artifact.get("artifact_path")
+            or "unknown artifact"
+        )
+        details = [
+            f"status={artifact.get('status') or 'unknown'}",
+            "baseline_contract_ok="
+            f"{_artifact_value_text(artifact.get('baseline_contract_ok'))}",
+            f"requirement_failures={int(artifact.get('requirement_failure_count') or 0)}",
+            f"capture_diagnostics={int(artifact.get('capture_diagnostic_count') or 0)}",
+        ]
+        lines.append(f"- {artifact_label}: {'; '.join(details)}")
 
 
 def _artifact_value_text(value: Any) -> str:
@@ -860,6 +1054,198 @@ def _diagnostic_summary_text(value: object) -> str | None:
     if not lines:
         return None
     return lines[-1]
+
+
+def _diagnostic_path_signature(value: object) -> str | None:
+    detail = str(value or "").strip().strip("\"'")
+    if not detail:
+        return None
+    if not (
+        detail.startswith(("/", "\\"))
+        or (len(detail) >= 3 and detail[1] == ":" and detail[2] in ("/", "\\"))
+    ):
+        return None
+    normalized = detail.replace("\\", "/")
+    segments = [segment for segment in normalized.split("/") if segment and segment not in {".", ".."}]
+    if not segments:
+        return None
+    tail = "/".join(segments[-2:])
+    return f"*/{tail}"
+
+
+def _diagnostic_error_signature(value: object) -> str | None:
+    summary = _diagnostic_summary_text(value)
+    if not summary:
+        return None
+    prefix, _, detail = summary.partition(":")
+    normalized_prefix = prefix.strip()
+    if normalized_prefix and " " not in normalized_prefix and normalized_prefix.endswith(("Error", "Exception")):
+        path_signature = _diagnostic_path_signature(detail)
+        if path_signature:
+            return f"{normalized_prefix}: {path_signature}"
+        return normalized_prefix
+    return summary
+
+
+def _aggregate_capture_diagnostic_groups(report_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if report_payload.get("report_type") != "aggregate":
+        return []
+
+    capture_diagnostics = report_payload.get("capture_diagnostics")
+    if not isinstance(capture_diagnostics, list):
+        capture_diagnostics = _packaging_baseline_report_capture_diagnostics(report_payload)
+    if not capture_diagnostics:
+        return []
+
+    grouped_diagnostics: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for diagnostic in capture_diagnostics:
+        if not isinstance(diagnostic, Mapping):
+            continue
+        artifact_path = str(diagnostic.get("artifact_path") or "unknown artifact")
+        artifact_label = str(diagnostic.get("artifact_label") or _artifact_group_label(artifact_path))
+        artifact_display_label = str(
+            diagnostic.get("artifact_display_label") or _artifact_display_label(artifact_path)
+        )
+        capture_name = str(diagnostic.get("capture_name") or "unknown")
+        capture_label = str(diagnostic.get("capture_label") or capture_name or "unknown")
+        reason = _diagnostic_summary_text(diagnostic.get("reason"))
+        packaging_error_signature = _diagnostic_error_signature(diagnostic.get("packaging_error"))
+        packaging_error_summary = _diagnostic_summary_text(diagnostic.get("packaging_error"))
+        packaging_blockers = _copy_string_list(diagnostic.get("packaging_blockers"))
+        bootstrap_build_requirements = _copy_string_list(diagnostic.get("bootstrap_build_requirements"))
+        key = (
+            capture_name,
+            capture_label,
+            diagnostic.get("failed_step"),
+            diagnostic.get("strategy_family"),
+            diagnostic.get("strategy"),
+            reason,
+            packaging_error_signature,
+            tuple(packaging_blockers),
+            tuple(bootstrap_build_requirements),
+            diagnostic.get("bootstrap_build_deps_ready"),
+            diagnostic.get("packaging_smoke_ready_with_bootstrap"),
+        )
+        group = grouped_diagnostics.setdefault(
+            key,
+            {
+                "capture_name": capture_name,
+                "capture_label": capture_label,
+                "failed_step": diagnostic.get("failed_step"),
+                "strategy_family": diagnostic.get("strategy_family"),
+                "strategy": diagnostic.get("strategy"),
+                "reason": reason,
+                "packaging_error_signature": packaging_error_signature,
+                "packaging_error_summaries": [],
+                "packaging_blockers": packaging_blockers,
+                "bootstrap_build_requirements": bootstrap_build_requirements,
+                "bootstrap_build_deps_ready": diagnostic.get("bootstrap_build_deps_ready"),
+                "packaging_smoke_ready_with_bootstrap": diagnostic.get("packaging_smoke_ready_with_bootstrap"),
+                "artifact_labels": [],
+                "artifact_display_labels": [],
+                "artifact_paths": [],
+            },
+        )
+        if packaging_error_summary and packaging_error_summary not in group["packaging_error_summaries"]:
+            group["packaging_error_summaries"].append(packaging_error_summary)
+        if artifact_label not in group["artifact_labels"]:
+            group["artifact_labels"].append(artifact_label)
+        if artifact_display_label not in group["artifact_display_labels"]:
+            group["artifact_display_labels"].append(artifact_display_label)
+        if artifact_path not in group["artifact_paths"]:
+            group["artifact_paths"].append(artifact_path)
+
+    return [
+        {
+            **group,
+            "artifact_count": len(group["artifact_paths"]),
+            "packaging_error_summary_count": len(group["packaging_error_summaries"]),
+        }
+        for group in grouped_diagnostics.values()
+    ]
+
+
+def _append_capture_diagnostic_group_lines(lines: list[str], report_payload: Mapping[str, Any]) -> None:
+    capture_diagnostic_groups = report_payload.get("capture_diagnostic_groups")
+    if not isinstance(capture_diagnostic_groups, list):
+        capture_diagnostic_groups = _aggregate_capture_diagnostic_groups(report_payload)
+    if not capture_diagnostic_groups:
+        return
+
+    lines.append("Drift diagnostic groups:")
+    for group in capture_diagnostic_groups:
+        if not isinstance(group, Mapping):
+            continue
+
+        details: list[str] = []
+        failed_step = group.get("failed_step")
+        if failed_step is not None:
+            details.append(f"failed_step={failed_step}")
+
+        strategy_family = group.get("strategy_family")
+        if strategy_family is not None:
+            details.append(f"strategy_family={strategy_family}")
+
+        strategy = group.get("strategy")
+        if strategy is not None:
+            details.append(f"strategy={strategy}")
+
+        reason = group.get("reason")
+        if reason:
+            details.append(f"reason={reason}")
+
+        packaging_error_summaries = group.get("packaging_error_summaries")
+        if not isinstance(packaging_error_summaries, list):
+            packaging_error_summaries = []
+        packaging_error_summaries = [str(summary) for summary in packaging_error_summaries if str(summary).strip()]
+        packaging_error_signature = str(group.get("packaging_error_signature") or "").strip()
+        if packaging_error_summaries:
+            if len(packaging_error_summaries) == 1:
+                details.append(f"packaging_error={packaging_error_summaries[0]}")
+            elif packaging_error_signature:
+                details.append(
+                    f"packaging_error={packaging_error_signature} ({len(packaging_error_summaries)} variants)"
+                )
+            else:
+                details.append(f"packaging_error_variants={len(packaging_error_summaries)}")
+
+        packaging_blockers = group.get("packaging_blockers")
+        if isinstance(packaging_blockers, list) and packaging_blockers:
+            details.append(f"blockers={', '.join(str(blocker) for blocker in packaging_blockers)}")
+
+        bootstrap_build_requirements = group.get("bootstrap_build_requirements")
+        if isinstance(bootstrap_build_requirements, list) and bootstrap_build_requirements:
+            details.append(
+                "bootstrap_build_requirements="
+                + ", ".join(str(requirement) for requirement in bootstrap_build_requirements)
+            )
+
+        if group.get("bootstrap_build_deps_ready") is not None:
+            details.append(
+                "bootstrap_build_deps_ready="
+                f"{_artifact_value_text(group.get('bootstrap_build_deps_ready'))}"
+            )
+        if group.get("packaging_smoke_ready_with_bootstrap") is not None:
+            details.append(
+                "packaging_smoke_ready_with_bootstrap="
+                f"{_artifact_value_text(group.get('packaging_smoke_ready_with_bootstrap'))}"
+            )
+
+        detail_text = "; ".join(details) if details else "diagnostic details unavailable"
+        artifact_labels = (
+            group.get("artifact_display_labels")
+            if isinstance(group.get("artifact_display_labels"), list)
+            else group.get("artifact_labels")
+            if isinstance(group.get("artifact_labels"), list)
+            else []
+        )
+        artifact_label_text = ", ".join(str(label) for label in artifact_labels if str(label).strip()) or "unknown"
+        artifact_count = int(group.get("artifact_count") or 0)
+        artifact_noun = "artifact" if artifact_count == 1 else "artifacts"
+        lines.append(
+            f"- {group.get('capture_label') or group.get('capture_name') or 'unknown'}: {detail_text} "
+            f"({artifact_count} {artifact_noun}: {artifact_label_text})"
+        )
 
 
 def _append_capture_diagnostic_lines(lines: list[str], report_payload: Mapping[str, Any]) -> None:
@@ -912,7 +1298,7 @@ def _append_capture_diagnostic_lines(lines: list[str], report_payload: Mapping[s
 
         summary = "; ".join(details) if details else "diagnostic details unavailable"
         lines.append(
-            f"- {diagnostic.get('artifact_label') or 'unknown'} / "
+            f"- {diagnostic.get('artifact_display_label') or diagnostic.get('artifact_label') or 'unknown'} / "
             f"{diagnostic.get('capture_label') or diagnostic.get('capture_name') or 'unknown'}: {summary}"
         )
 
@@ -1210,7 +1596,9 @@ def _format_aggregate_packaging_baseline_text(report_payload: Mapping[str, Any])
         f"all_baseline_contracts_ok: {_artifact_value_text(summary.get('all_baseline_contracts_ok'))}",
     ]
     lines.extend(_github_run_download_lines(download))
+    _append_artifact_status_summary_lines(lines, report_payload)
     _append_requirement_failure_group_lines(lines, report_payload)
+    _append_capture_diagnostic_group_lines(lines, report_payload)
     _append_capture_diagnostic_lines(lines, report_payload)
     warnings = report_payload.get("warnings")
     if isinstance(warnings, list) and warnings:

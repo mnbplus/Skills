@@ -15,7 +15,6 @@ from xml.etree import ElementTree
 
 from .cache import ResourceCache
 from .common import (
-    SUBTITLE_TERMS,
     clean_share_url,
     compact_spaces,
     detect_kind,
@@ -32,7 +31,6 @@ from .common import (
     parse_quality_tags,
     quality_display_from_tags,
     source_priority,
-    text_contains_any,
     title_core,
     title_tokens,
     token_overlap_score,

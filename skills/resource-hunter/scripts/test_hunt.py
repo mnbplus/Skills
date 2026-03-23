@@ -5,8 +5,8 @@ from _bootstrap import bootstrap_src
 
 bootstrap_src()
 
-from resource_hunter.common import ensure_utf8_stdio
-from resource_hunter.core import parse_intent
+from resource_hunter.common import ensure_utf8_stdio  # noqa: E402
+from resource_hunter.core import parse_intent  # noqa: E402
 
 
 def main() -> int:

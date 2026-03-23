@@ -29,12 +29,16 @@ def test_build_plan_respects_routing_preferences():
     assert anime_plan.channels == ["torrent", "pan"]
     assert anime_plan.preferred_torrent_sources[0] == "nyaa"
     assert any("subtitle" in item.lower() for item in anime_plan.torrent_queries)
+    assert anime_plan.source_query_plan["nyaa"]
+    assert anime_plan.query_budgets["nyaa"] >= 1
 
     movie = parse_intent("Oppenheimer 2023", wants_4k=True)
     movie_plan = build_plan(movie)
     assert movie_plan.channels == ["pan", "torrent"]
     assert movie_plan.preferred_torrent_sources[0] == "yts"
     assert any("2160p" in item.lower() or "4k" in item.lower() for item in movie_plan.pan_queries + movie_plan.torrent_queries)
+    assert movie_plan.torrent_query_graph
+    assert movie_plan.source_query_plan["yts"]
 
 
 def test_chinese_title_with_year_defaults_to_movie():
