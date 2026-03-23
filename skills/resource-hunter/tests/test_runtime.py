@@ -47,6 +47,112 @@ def _run_runtime_cli(*args: str, cwd: Path | None = None) -> subprocess.Complete
     )
 
 
+def _run_source_checkout_script(script_name: str, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / script_name), *args],
+        cwd=str(cwd or ROOT),
+        env=_runtime_cli_env(),
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+
+
+def _write_packaging_baseline_artifact(
+    root: Path,
+    artifact_name: str,
+    *,
+    baseline_contract_ok: bool,
+) -> Path:
+    artifact_dir = root / artifact_name
+    artifact_dir.mkdir(parents=True)
+    artifact_path = artifact_dir / "packaging-baseline.json"
+    blocked_warning = "Blocked capture did not report failed_step."
+    blocked_capture = {
+        "path": str(artifact_dir / "blocked-packaging-capture.json"),
+        "project_root": str(root),
+        "project_root_source": "argument",
+        "requested_project_root": str(root),
+        "packaging_python": str(root / "__blocked_python__" / "missing-python"),
+        "packaging_python_source": "argument",
+        "doctor_packaging_ready": False,
+        "packaging_smoke_ok": False,
+        "strategy": "blocked" if baseline_contract_ok else "prefix-install",
+        "strategy_family": "blocked" if baseline_contract_ok else "usable",
+        "reason": "Packaging smoke blocked." if baseline_contract_ok else "Packaging smoke unexpectedly passed.",
+        "failed_step": "packaging-status" if baseline_contract_ok else None,
+        "expected_outcome": {
+            "doctor_packaging_ready": False,
+            "packaging_smoke_ok": False,
+            "failed_step_present": True,
+            "strategy_family_any_of": ["blocked"],
+        },
+        "matches_expectation": baseline_contract_ok,
+        "expectation_drift": []
+        if baseline_contract_ok
+        else [
+            {
+                "capture": "blocked",
+                "field": "failed_step",
+                "kind": "missing_failed_step",
+                "expected_present": True,
+                "actual": None,
+                "message": blocked_warning,
+            }
+        ],
+    }
+    payload = {
+        "schema_version": 1,
+        "captured_at": "2026-03-23T00:00:00Z",
+        "output_dir": str(artifact_dir),
+        "project_root": str(root),
+        "project_root_source": "argument",
+        "requested_project_root": str(root),
+        "blocked_python": str(root / "__blocked_python__" / "missing-python"),
+        "passing_capture": {
+            "path": str(artifact_dir / "passing-packaging-capture.json"),
+            "project_root": str(root),
+            "project_root_source": "argument",
+            "requested_project_root": str(root),
+            "packaging_python": sys.executable,
+            "packaging_python_source": "current",
+            "doctor_packaging_ready": True,
+            "packaging_smoke_ok": True,
+            "strategy": "venv",
+            "strategy_family": "usable",
+            "reason": "Packaging smoke passed.",
+            "failed_step": None,
+            "expected_outcome": {
+                "doctor_packaging_ready": True,
+                "packaging_smoke_ok": True,
+                "failed_step_present": False,
+                "strategy_family_any_of": ["usable"],
+            },
+            "matches_expectation": True,
+            "expectation_drift": [],
+        },
+        "blocked_capture": blocked_capture,
+        "summary": {
+            "passing_capture_matches_expectation": True,
+            "blocked_capture_matches_expectation": baseline_contract_ok,
+            "baseline_contract_ok": baseline_contract_ok,
+        },
+        "warnings": [] if baseline_contract_ok else [blocked_warning],
+        "requirements": {
+            "require_expected_outcomes": True,
+            "ok": baseline_contract_ok,
+            "failures": []
+            if baseline_contract_ok
+            else [f"Packaging baseline requirement failed: {blocked_warning}"],
+        },
+    }
+    artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+    return artifact_path
+
+
 def test_resource_hunter_home_override(monkeypatch, tmp_path):
     home = tmp_path / "rh-home"
     monkeypatch.setenv("RESOURCE_HUNTER_HOME", str(home))
@@ -564,3 +670,45 @@ def test_packaging_capture_json_bad_packaging_python_emits_bundle_subprocess(tmp
         f"Unable to inspect packaging modules via {missing_python}:"
     )
     assert payload["packaging_smoke"]["failed_step"] == "packaging-status"
+
+
+def test_packaging_gate_script_reports_downloaded_artifact_drift_subprocess(tmp_path):
+    artifact_root = tmp_path / "downloaded-gh-artifacts"
+    _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    drift_path = _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+
+    result = _run_source_checkout_script("packaging_gate.py", "--json", str(artifact_root))
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "gate_schema_version": 1,
+        "ok": False,
+        "failure_count": 1,
+        "failures": [
+            f"{drift_path.resolve()}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
+        ],
+        "report_type": "aggregate",
+        "summary": {
+            "artifact_count": 2,
+            "contract_ok_artifact_count": 1,
+            "contract_drift_artifact_count": 1,
+            "requirement_failed_artifact_count": 1,
+            "warning_count": 1,
+            "all_baseline_contracts_ok": False,
+        },
+        "artifacts_with_contract_drift": [str(drift_path.resolve())],
+        "artifacts_with_requirement_failures": [str(drift_path.resolve())],
+    }
+    assert (
+        f"{drift_path.resolve()}: Packaging baseline requirement failed: Blocked capture did not report failed_step."
+        in result.stderr
+    )

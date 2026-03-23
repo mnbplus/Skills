@@ -108,6 +108,80 @@ def _supports_wheel_build() -> bool:
         return False
 
 
+def _write_packaging_baseline_artifact(root: Path, artifact_name: str) -> Path:
+    artifact_dir = root / artifact_name
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "packaging-baseline.json"
+    blocked_python_name = "python.exe" if os.name == "nt" else "python"
+    blocked_python = artifact_dir / "__blocked_python__" / blocked_python_name
+    payload = {
+        "schema_version": 1,
+        "captured_at": "2026-03-23T00:00:00Z",
+        "output_dir": str(artifact_dir),
+        "project_root": str(ROOT),
+        "project_root_source": "argument",
+        "requested_project_root": str(ROOT),
+        "blocked_python": str(blocked_python),
+        "passing_capture": {
+            "path": str(artifact_dir / "passing-packaging-capture.json"),
+            "project_root": str(ROOT),
+            "project_root_source": "argument",
+            "requested_project_root": str(ROOT),
+            "packaging_python": sys.executable,
+            "packaging_python_source": "current",
+            "doctor_packaging_ready": True,
+            "packaging_smoke_ok": True,
+            "strategy": "venv",
+            "strategy_family": "usable",
+            "reason": "Packaging smoke passed.",
+            "failed_step": None,
+            "expected_outcome": {
+                "doctor_packaging_ready": True,
+                "packaging_smoke_ok": True,
+                "failed_step_present": False,
+                "strategy_family_any_of": ["usable"],
+            },
+            "matches_expectation": True,
+            "expectation_drift": [],
+        },
+        "blocked_capture": {
+            "path": str(artifact_dir / "blocked-packaging-capture.json"),
+            "project_root": str(ROOT),
+            "project_root_source": "argument",
+            "requested_project_root": str(ROOT),
+            "packaging_python": str(blocked_python),
+            "packaging_python_source": "argument",
+            "doctor_packaging_ready": False,
+            "packaging_smoke_ok": False,
+            "strategy": "blocked",
+            "strategy_family": "blocked",
+            "reason": "Packaging smoke blocked.",
+            "failed_step": "packaging-status",
+            "expected_outcome": {
+                "doctor_packaging_ready": False,
+                "packaging_smoke_ok": False,
+                "failed_step_present": True,
+                "strategy_family_any_of": ["blocked"],
+            },
+            "matches_expectation": True,
+            "expectation_drift": [],
+        },
+        "summary": {
+            "passing_capture_matches_expectation": True,
+            "blocked_capture_matches_expectation": True,
+            "baseline_contract_ok": True,
+        },
+        "warnings": [],
+        "requirements": {
+            "require_expected_outcomes": True,
+            "ok": True,
+            "failures": [],
+        },
+    }
+    artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+    return artifact_path
+
+
 def test_find_project_root_walks_up(tmp_path):
     project_root = tmp_path / "repo"
     nested = project_root / "scripts" / "nested"
@@ -737,7 +811,7 @@ def test_prefix_console_script_prefers_generated_entrypoint(tmp_path):
     assert _prefix_console_script(tmp_path, "resource-hunter") == expected
 
 
-def test_python_m_resource_hunter_help_after_wheel_install(tmp_path):
+def test_resource_hunter_entrypoints_after_wheel_install(tmp_path):
     if not _supports_wheel_build():
         pytest.skip("pip, wheel, or setuptools build backend unavailable in this interpreter")
 
@@ -763,6 +837,12 @@ def test_python_m_resource_hunter_help_after_wheel_install(tmp_path):
     wheels = sorted(dist_dir.glob("resource_hunter-*.whl"))
     assert len(wheels) == 1
 
+    artifact_root = tmp_path / "downloaded-gh-artifacts"
+    artifact_path = _write_packaging_baseline_artifact(
+        artifact_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+    )
+
     if _supports_venv():
         import venv
 
@@ -780,6 +860,10 @@ def test_python_m_resource_hunter_help_after_wheel_install(tmp_path):
         assert console_script.exists(), f"console script not generated: {console_script}"
         console_help_result = _run_command([str(console_script), "--help"], cwd=tmp_path)
         console_version_result = _run_command([str(console_script), "--version"], cwd=tmp_path)
+        gate_console_script = _venv_console_script(venv_dir, "resource-hunter-packaging-baseline-gate")
+        assert gate_console_script.exists(), f"packaging gate console script not generated: {gate_console_script}"
+        gate_help_result = _run_command([str(gate_console_script), "--help"], cwd=tmp_path)
+        gate_json_result = _run_command([str(gate_console_script), "--json", str(artifact_root)], cwd=tmp_path)
     else:
         install_root = tmp_path / "wheel-install"
         install_result = _run_command(
@@ -794,6 +878,10 @@ def test_python_m_resource_hunter_help_after_wheel_install(tmp_path):
         assert console_script.exists(), f"console script not generated: {console_script}"
         console_help_result = _run_command([str(console_script), "--help"], cwd=tmp_path, env=env)
         console_version_result = _run_command([str(console_script), "--version"], cwd=tmp_path, env=env)
+        gate_console_script = _prefix_console_script(install_root, "resource-hunter-packaging-baseline-gate")
+        assert gate_console_script.exists(), f"packaging gate console script not generated: {gate_console_script}"
+        gate_help_result = _run_command([str(gate_console_script), "--help"], cwd=tmp_path, env=env)
+        gate_json_result = _run_command([str(gate_console_script), "--json", str(artifact_root)], cwd=tmp_path, env=env)
 
     assert help_result.returncode == 0, help_result.stderr or help_result.stdout
     assert "usage:" in help_result.stdout
@@ -807,3 +895,19 @@ def test_python_m_resource_hunter_help_after_wheel_install(tmp_path):
     if console_version_result is not None:
         assert console_version_result.returncode == 0, console_version_result.stderr or console_version_result.stdout
         assert console_version_result.stdout.strip() == f"resource-hunter {__version__}"
+    assert gate_help_result.returncode == 0, gate_help_result.stderr or gate_help_result.stdout
+    assert "usage:" in gate_help_result.stdout
+    assert gate_json_result.returncode == 0, gate_json_result.stderr or gate_json_result.stdout
+    assert json.loads(gate_json_result.stdout) == {
+        "gate_schema_version": 1,
+        "ok": True,
+        "failure_count": 0,
+        "failures": [],
+        "report_type": "single",
+        "summary": {
+            "passing_capture_matches_expectation": True,
+            "blocked_capture_matches_expectation": True,
+            "baseline_contract_ok": True,
+        },
+        "artifact_path": str(artifact_path.resolve()),
+    }

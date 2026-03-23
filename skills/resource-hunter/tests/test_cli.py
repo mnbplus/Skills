@@ -2159,6 +2159,140 @@ def test_cli_packaging_baseline_report_defaults_to_local_artifact(monkeypatch, c
     assert "- expectation_drift: none" in output
 
 
+def test_cli_packaging_baseline_report_aggregate_json_require_contract_ok(capsys, tmp_path):
+    def baseline_payload(project_root: Path, *, baseline_contract_ok: bool, warnings: list[str], failures: list[str]):
+        return {
+            "schema_version": 1,
+            "captured_at": "2026-03-23T00:00:00Z",
+            "output_dir": str(project_root),
+            "project_root": str(project_root),
+            "project_root_source": "argument",
+            "blocked_python": str(project_root / "__blocked_python__" / "missing-python"),
+            "passing_capture": {
+                "path": str(project_root / "passing-packaging-capture.json"),
+                "project_root": str(project_root),
+                "project_root_source": "argument",
+                "packaging_python": sys.executable,
+                "packaging_python_source": "current",
+                "doctor_packaging_ready": True,
+                "packaging_smoke_ok": True,
+                "strategy": "prefix-install",
+                "strategy_family": "usable",
+                "reason": "Packaging smoke passed.",
+                "failed_step": None,
+                "expected_outcome": {
+                    "doctor_packaging_ready": True,
+                    "packaging_smoke_ok": True,
+                    "failed_step_present": False,
+                    "strategy_family_any_of": ["usable", "bootstrap"],
+                },
+                "matches_expectation": True,
+                "expectation_drift": [],
+            },
+            "blocked_capture": {
+                "path": str(project_root / "blocked-packaging-capture.json"),
+                "project_root": str(project_root),
+                "project_root_source": "argument",
+                "packaging_python": str(project_root / "__blocked_python__" / "missing-python"),
+                "packaging_python_source": "argument",
+                "doctor_packaging_ready": False,
+                "packaging_smoke_ok": False,
+                "strategy": "missing-python",
+                "strategy_family": "blocked" if baseline_contract_ok else "usable",
+                "reason": "Python executable was not found.",
+                "failed_step": "packaging-status" if baseline_contract_ok else None,
+                "expected_outcome": {
+                    "doctor_packaging_ready": False,
+                    "packaging_smoke_ok": False,
+                    "failed_step_present": True,
+                    "strategy_family_any_of": ["blocked"],
+                },
+                "matches_expectation": baseline_contract_ok,
+                "expectation_drift": []
+                if baseline_contract_ok
+                else [
+                    {
+                        "capture": "blocked",
+                        "field": "failed_step",
+                        "kind": "missing_failed_step",
+                        "expected_present": True,
+                        "actual": None,
+                        "message": "Blocked capture did not report failed_step.",
+                    }
+                ],
+            },
+            "summary": {
+                "passing_capture_matches_expectation": True,
+                "blocked_capture_matches_expectation": baseline_contract_ok,
+                "baseline_contract_ok": baseline_contract_ok,
+            },
+            "warnings": warnings,
+            "requirements": {
+                "require_expected_outcomes": True,
+                "ok": not failures,
+                "failures": failures,
+            },
+        }
+
+    artifact_root = tmp_path / "downloaded-gh-artifacts"
+    passing_path = artifact_root / "job-a" / "packaging-baseline.json"
+    passing_path.parent.mkdir(parents=True)
+    passing_path.write_text(
+        json.dumps(
+            baseline_payload(
+                tmp_path / "job-a",
+                baseline_contract_ok=True,
+                warnings=[],
+                failures=[],
+            )
+        ),
+        encoding="utf-8",
+    )
+    drift_path = artifact_root / "job-b" / "nested" / "packaging-baseline.json"
+    drift_path.parent.mkdir(parents=True)
+    drift_path.write_text(
+        json.dumps(
+            baseline_payload(
+                tmp_path / "job-b",
+                baseline_contract_ok=False,
+                warnings=["Blocked capture did not report failed_step."],
+                failures=[
+                    "Packaging baseline requirement failed: Blocked capture did not report failed_step."
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(
+        ["packaging-baseline-report", "--json", "--require-contract-ok", str(artifact_root)]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    report = json.loads(captured.out)
+    assert report["report_type"] == "aggregate"
+    assert report["summary"] == {
+        "artifact_count": 2,
+        "contract_ok_artifact_count": 1,
+        "contract_drift_artifact_count": 1,
+        "requirement_failed_artifact_count": 1,
+        "warning_count": 1,
+        "all_baseline_contracts_ok": False,
+    }
+    assert report["artifacts_with_contract_drift"] == [str(drift_path.resolve())]
+    assert report["artifacts_with_requirement_failures"] == [str(drift_path.resolve())]
+    assert report["warnings"] == [f"{drift_path.resolve()}: Blocked capture did not report failed_step."]
+    assert [artifact["artifact_path"] for artifact in report["artifacts"]] == [
+        str(passing_path.resolve()),
+        str(drift_path.resolve()),
+    ]
+    assert (
+        f"{drift_path.resolve()}: Packaging baseline requirement failed: "
+        "Blocked capture did not report failed_step."
+    ) in captured.err
+
+
 def test_cli_version_flag(capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["--version"])

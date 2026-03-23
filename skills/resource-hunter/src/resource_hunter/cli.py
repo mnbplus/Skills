@@ -22,8 +22,6 @@ _PACKAGING_PYTHON_ENV = "RESOURCE_HUNTER_PACKAGING_PYTHON"
 _AUTO_PACKAGING_PYTHON = "auto"
 _PACKAGING_CAPTURE_SCHEMA_VERSION = 1
 _PACKAGING_BASELINE_SCHEMA_VERSION = 1
-_PACKAGING_BASELINE_REPORT_SCHEMA_VERSION = packaging_report.PACKAGING_BASELINE_REPORT_SCHEMA_VERSION
-_DEFAULT_PACKAGING_BASELINE_ARTIFACT = Path("artifacts") / "packaging-baseline" / "packaging-baseline.json"
 
 
 def _resolve_kind(args: argparse.Namespace) -> str | None:
@@ -207,10 +205,6 @@ def _format_packaging_baseline_issue(issue: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def _packaging_baseline_report_payload(payload: dict[str, Any], *, artifact_path: Path) -> dict[str, Any]:
-    return packaging_report.build_packaging_baseline_report(payload, artifact_path=artifact_path)
-
-
 def _packaging_baseline_report_capture_match(
     report_payload: dict[str, Any],
     *,
@@ -225,83 +219,6 @@ def _packaging_baseline_report_capture_match(
         if capture.get("name") == capture_name:
             return capture.get("matches_expectation")
     return None
-
-
-def _packaging_baseline_report_artifact_paths(raw_paths: list[str] | None) -> list[Path]:
-    requested_paths = list(raw_paths or [])
-    if not requested_paths:
-        requested_paths = [str(_DEFAULT_PACKAGING_BASELINE_ARTIFACT)]
-
-    artifact_paths: list[Path] = []
-    empty_directories: list[Path] = []
-    seen: set[str] = set()
-    for raw_path in requested_paths:
-        candidate = Path(raw_path).resolve()
-        if candidate.is_dir():
-            matches = sorted(path.resolve() for path in candidate.rglob("packaging-baseline.json") if path.is_file())
-            if not matches:
-                empty_directories.append(candidate)
-                continue
-            for match in matches:
-                key = os.path.normcase(str(match))
-                if key in seen:
-                    continue
-                seen.add(key)
-                artifact_paths.append(match)
-            continue
-        key = os.path.normcase(str(candidate))
-        if key in seen:
-            continue
-        seen.add(key)
-        artifact_paths.append(candidate)
-
-    if empty_directories:
-        directories = ", ".join(str(path) for path in empty_directories)
-        raise ResourceHunterError(f"No packaging-baseline.json artifacts found under {directories}.")
-    if not artifact_paths:
-        raise ResourceHunterError("No packaging baseline artifacts were requested.")
-    return artifact_paths
-
-
-def _packaging_baseline_aggregate_report_payload(report_payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    contract_ok_artifact_count = 0
-    contract_drift_artifacts: list[str] = []
-    requirement_failed_artifacts: list[str] = []
-    warnings: list[str] = []
-    for report_payload in report_payloads:
-        artifact_path = str(report_payload.get("artifact_path") or "unknown")
-        summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), dict) else {}
-        requirements = (
-            report_payload.get("requirements") if isinstance(report_payload.get("requirements"), dict) else {}
-        )
-        artifact_warnings = report_payload.get("warnings")
-        if not isinstance(artifact_warnings, list):
-            artifact_warnings = []
-        if summary.get("baseline_contract_ok") is True:
-            contract_ok_artifact_count += 1
-        else:
-            contract_drift_artifacts.append(artifact_path)
-        if requirements.get("ok") is False:
-            requirement_failed_artifacts.append(artifact_path)
-        warnings.extend(f"{artifact_path}: {warning}" for warning in artifact_warnings)
-
-    artifact_count = len(report_payloads)
-    return {
-        "report_schema_version": _PACKAGING_BASELINE_REPORT_SCHEMA_VERSION,
-        "report_type": "aggregate",
-        "summary": {
-            "artifact_count": artifact_count,
-            "contract_ok_artifact_count": contract_ok_artifact_count,
-            "contract_drift_artifact_count": artifact_count - contract_ok_artifact_count,
-            "requirement_failed_artifact_count": len(requirement_failed_artifacts),
-            "warning_count": len(warnings),
-            "all_baseline_contracts_ok": contract_ok_artifact_count == artifact_count,
-        },
-        "artifacts_with_contract_drift": contract_drift_artifacts,
-        "artifacts_with_requirement_failures": requirement_failed_artifacts,
-        "warnings": warnings,
-        "artifacts": report_payloads,
-    }
 
 
 def _format_packaging_baseline_capture_text(capture: dict[str, Any]) -> list[str]:
@@ -493,37 +410,6 @@ def _format_packaging_baseline_aggregate_text(report_payload: dict[str, Any]) ->
         else:
             lines.append("- warning: none")
     return "\n".join(lines)
-
-
-def _load_packaging_baseline_payload(path: Path) -> dict[str, Any]:
-    return packaging_report.load_packaging_baseline_payload(path)
-
-
-def _packaging_baseline_report_requirement_failures(report_payload: dict[str, Any]) -> list[str]:
-    report_type = report_payload.get("report_type")
-    if report_type == "aggregate":
-        artifacts = report_payload.get("artifacts")
-        if not isinstance(artifacts, list):
-            return ["Packaging baseline aggregate report did not contain artifacts."]
-        failures: list[str] = []
-        for artifact in artifacts:
-            if not isinstance(artifact, dict):
-                continue
-            failures.extend(_packaging_baseline_report_requirement_failures(artifact))
-        return failures
-
-    requirements = report_payload.get("requirements") if isinstance(report_payload.get("requirements"), dict) else {}
-    requirement_failures = requirements.get("failures")
-    if not isinstance(requirement_failures, list):
-        requirement_failures = []
-    artifact_path = report_payload.get("artifact_path") or "unknown artifact"
-    if requirement_failures:
-        return [f"{artifact_path}: {failure}" for failure in requirement_failures]
-
-    summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), dict) else {}
-    if summary.get("baseline_contract_ok") is True:
-        return []
-    return [f"{artifact_path}: Packaging baseline contract drift detected."]
 
 
 def _format_doctor_text(payload: dict[str, Any]) -> str:
@@ -1223,19 +1109,7 @@ def _packaging_baseline(engine: ResourceHunterEngine, args: argparse.Namespace) 
 
 
 def _packaging_baseline_report(args: argparse.Namespace) -> int:
-    artifact_paths = _packaging_baseline_report_artifact_paths(getattr(args, "paths", None))
-    report_payloads = [
-        _packaging_baseline_report_payload(
-            _load_packaging_baseline_payload(artifact_path),
-            artifact_path=artifact_path,
-        )
-        for artifact_path in artifact_paths
-    ]
-    report_payload = (
-        report_payloads[0]
-        if len(report_payloads) == 1
-        else _packaging_baseline_aggregate_report_payload(report_payloads)
-    )
+    report_payload = packaging_report.read_packaging_baseline_reports(getattr(args, "paths", None))
     if getattr(args, "json", False):
         print(dump_json(report_payload))
     else:
@@ -1244,7 +1118,7 @@ def _packaging_baseline_report(args: argparse.Namespace) -> int:
         else:
             print(_format_packaging_baseline_text(report_payload))
     if getattr(args, "require_contract_ok", False):
-        failures = _packaging_baseline_report_requirement_failures(report_payload)
+        failures = packaging_report.packaging_baseline_report_requirement_failures(report_payload)
         if failures:
             for failure in failures:
                 print(failure, file=sys.stderr)
@@ -1546,7 +1420,7 @@ def build_parser() -> argparse.ArgumentParser:
         "paths",
         nargs="*",
         help=(
-            "artifact file(s) or directories to scan recursively for packaging-baseline.json; "
+            "artifact file(s), .zip archive(s), or directories to scan recursively for packaging-baseline.json; "
             "defaults to artifacts/packaging-baseline/packaging-baseline.json"
         ),
     )

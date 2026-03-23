@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import resource_hunter.cli as cli
@@ -99,6 +100,14 @@ def _write_packaging_baseline_artifact(
     return artifact_path
 
 
+def _write_packaging_baseline_archive(archive_path: Path, members: dict[str, dict[str, object]]) -> Path:
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for member_name, payload in members.items():
+            archive.writestr(member_name, json.dumps(payload))
+    return archive_path
+
+
 def test_cli_packaging_baseline_report_single_artifact_can_require_contract_ok(capsys, tmp_path):
     artifact_path = _write_packaging_baseline_artifact(
         tmp_path,
@@ -152,6 +161,36 @@ def test_cli_packaging_baseline_report_directory_aggregates_json(capsys, tmp_pat
     ]
     assert report["artifacts"][0]["report_type"] == "single"
     assert report["artifacts"][1]["summary"]["baseline_contract_ok"] is False
+
+
+def test_cli_packaging_baseline_report_zip_archive_aggregates_json(capsys, tmp_path):
+    scratch_root = tmp_path / "scratch"
+    ok_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-ubuntu-latest-py3.12",
+        baseline_contract_ok=True,
+    )
+    drift_path = _write_packaging_baseline_artifact(
+        scratch_root,
+        "resource-hunter-packaging-baseline-windows-latest-py3.13",
+        baseline_contract_ok=False,
+    )
+    archive_path = _write_packaging_baseline_archive(
+        tmp_path / "downloaded-artifacts.zip",
+        {
+            "job-a/packaging-baseline.json": json.loads(ok_path.read_text(encoding="utf-8")),
+            "job-b/packaging-baseline.json": json.loads(drift_path.read_text(encoding="utf-8")),
+        },
+    )
+
+    rc = cli.main(["packaging-baseline-report", "--json", str(archive_path)])
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["report_type"] == "aggregate"
+    assert report["artifacts_with_contract_drift"] == [
+        f"{archive_path.resolve()}!/job-b/packaging-baseline.json"
+    ]
 
 
 def test_cli_packaging_baseline_report_directory_without_artifacts_errors(capsys, tmp_path):
