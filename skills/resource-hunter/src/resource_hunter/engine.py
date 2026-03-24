@@ -10,6 +10,7 @@ from typing import Any
 from .adapters import (
     AliasResolver,
     AnimeToshoSource,
+    PanSearchSource,
     DaliPanSource,
     DMHYSource,
     EZTVSource,
@@ -62,7 +63,7 @@ class ResourceHunterEngine:
         self.cache = cache or ResourceCache()
         self.http_client = http_client or HTTPClient(retries=1, default_timeout=10)
         self.alias_resolver = AliasResolver()
-        self.pan_sources: list[SourceAdapter] = [TwoFunSource(), DaliPanSource(), HunhepanSource(), PansouVipSource(), TiebaSource()]
+        self.pan_sources: list[SourceAdapter] = [TwoFunSource(), DaliPanSource(), PanSearchSource(), HunhepanSource(), PansouVipSource(), TiebaSource()]
         self.torrent_sources: list[SourceAdapter] = [
             NyaaSource(),
             AnimeToshoSource(),
@@ -338,6 +339,16 @@ class ResourceHunterEngine:
             result.to_public_dict() for result in results if result.actionability in {"direct", "actionable"}
         ][:5]
         best_clues = [result.to_public_dict() for result in results if result.actionability == "clue"][:5]
+        best_validated_results = [
+            result.to_public_dict()
+            for result in results
+            if result.validation_status == "validated" and result.actionability == "direct"
+        ][:3]
+        best_non_conflict_results = [
+            result.to_public_dict()
+            for result in results
+            if result.validation_status not in {"conflict", "clue"}
+        ][:5]
 
         response = {
             "query": intent.original_query,
@@ -363,10 +374,12 @@ class ResourceHunterEngine:
                 "source_query_plan": dict(plan.source_query_plan),
                 "retrieval_layers": retrieval_layers_used,
                 "best_direct_results": best_direct_results,
+                "best_validated_results": best_validated_results,
                 "best_actionable_results": best_actionable_results,
+                "best_non_conflict_results": best_non_conflict_results,
                 "best_clues": best_clues,
                 "success_estimate": {
-                    "has_direct": bool(best_direct_results),
+                    "has_direct": bool(best_validated_results),
                     "has_actionable": bool(best_actionable_results),
                     "has_clues": bool(best_clues),
                 },

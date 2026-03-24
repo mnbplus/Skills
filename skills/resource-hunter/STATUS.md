@@ -39,7 +39,7 @@
 - Known limits still open:
   - `The Merry Widow 1952` remains improved but not solved end-to-end
   - `dalipan` still needs a future follow-up on detail/url completion and transport hardening
-  - `PanSearch` has real results when queried correctly, but still needs content-card link extraction before runtime integration
+  - `PanSearch` is now runtime-integrated through public `keyword=` + Next.js payload extraction, but remains exposed to content-card drift and upstream layout changes
   - public HTML discovery sources remain subject to blocking, layout drift, and rate limits
 - Saturation:
   - source expansion is now meaningful enough to prepare a syncable version

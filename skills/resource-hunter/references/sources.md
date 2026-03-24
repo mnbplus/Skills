@@ -12,6 +12,11 @@
   - Priority: `1`
   - Role: API-backed structured search source
   - Current limitation: runtime currently exposes Dalipan as **token-only clue output** (`dalipan://provider/eu-token`) because anonymous `detail/url` resolution is not fully open yet
+  - Hardening note: SSL-bypass fallback is now restricted to SSL/certificate-like search failures; optional detail/url follow-up is isolated from the main search batch
+- `pansearch`
+  - Channel: `pan`
+  - Priority: `2`
+  - Role: public Next.js search source that extracts embedded share links from content cards
 - `hunhepan`
   - Channel: `pan`
   - Priority: `2`
@@ -26,6 +31,10 @@
   - Channel: `pan`
   - Priority: `4`
   - Role: public thread clue mining for pan links, passwords, magnets, and manual follow-up hints
+  - Clue semantics:
+    - `raw.delivery=thread_clue`
+    - `raw.retrieval_role=clue`
+    - `raw.requires_follow_up=true`
 
 ### Direct structured torrent
 - `nyaa`
@@ -77,7 +86,7 @@
 ## Retrieval layers
 
 - `direct-structured-pan`
-  - Sources: `2fun -> dalipan -> hunhepan -> pansou.vip`
+  - Sources: `2fun -> dalipan -> pansearch -> hunhepan -> pansou.vip`
   - Goal: first-pass structured pan results
 - `direct-structured-torrent`
   - Sources: `nyaa -> animetosho -> dmhy -> eztv -> tpb -> torlock -> yts -> 1337x`
@@ -104,5 +113,26 @@
 - Every active search stores `source_status` snapshots for direct sources
 - `sources --probe` actively tests registered pan/torrent adapters
 - Indexed discovery providers are fallback providers and are not equivalent to stable structured direct-source guarantees
+- Clue-only / follow-up-required results should now be understood through shared result semantics:
+  - `raw.retrieval_role=clue`
+  - `raw.requires_follow_up=true`
+  - `raw.delivery=token_only|thread_clue|indexed_clue`
+- `pansearch` currently qualifies for runtime because `keyword=` queries and `__NEXT_DATA__` / `_next/data` payloads expose embedded canonical share URLs that can be normalized into direct/actionable results
+- This matters because a password alone no longer upgrades a follow-up-required clue into an actionable direct-style result
 - External public sources may throttle, change formats, break without notice, or vary by region
 - `dalipan` is currently a release with an explicit limitation: anonymous search works, but final detail/url resolution is not yet fully anonymous in current runtime
+
+## Source integration fixed touchpoints
+
+For every newly admitted source, prefer limiting code changes to these touchpoints:
+
+- source adapter implementation in `src/resource_hunter/adapters.py` or a dedicated source-side file
+- `SOURCE_RUNTIME_PROFILES`
+- `src/resource_hunter/common.py` source priority
+- `src/resource_hunter/engine.py` registration
+- `src/resource_hunter/intent.py` source family / order / query budget wiring
+- `src/resource_hunter/retrieval_layers.py` layer metadata
+- `src/resource_hunter/core.py` / `src/resource_hunter/precision_core.py` compatibility exports
+- targeted tests and reference docs
+
+If a new source requires broader edits than this without clear justification, treat it as a signal that the source is not ready for low-risk runtime integration yet.

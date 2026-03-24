@@ -1,4 +1,4 @@
-from resource_hunter.core import deduplicate_results, fuse_result_evidence, parse_intent, score_result, validate_result
+from resource_hunter.core import deduplicate_results, format_search_text, fuse_result_evidence, parse_intent, score_result, validate_result
 from resource_hunter.models import SearchResult
 
 
@@ -86,12 +86,87 @@ def test_validate_result_marks_manual_follow_up_as_clue():
         provider="baidu_clue",
         title="赤橙黄绿青蓝紫",
         link_or_magnet="https://tieba.baidu.com/p/123",
-        raw={"manual_follow_up": True},
+        raw={
+            "manual_follow_up": True,
+            "delivery": "thread_clue",
+            "retrieval_role": "clue",
+            "requires_follow_up": True,
+        },
     )
     validated = validate_result(result, intent)
     assert validated.validation_status == "clue"
     assert validated.actionability == "clue"
-    assert any("manual follow-up" in item for item in validated.validation_signals)
+    assert any("follow-up clue" in item for item in validated.validation_signals)
+
+
+def test_validate_result_keeps_passworded_follow_up_result_as_clue():
+    intent = parse_intent("赤橙黄绿青蓝紫 1982")
+    result = SearchResult(
+        channel="pan",
+        source="tieba",
+        provider="baidu_clue",
+        title="赤橙黄绿青蓝紫",
+        link_or_magnet="https://tieba.baidu.com/p/123",
+        password="y3bq",
+        raw={
+            "manual_follow_up": True,
+            "delivery": "thread_clue",
+            "retrieval_role": "clue",
+            "requires_follow_up": True,
+        },
+    )
+    validated = validate_result(result, intent)
+    assert validated.validation_status == "clue"
+    assert validated.actionability == "clue"
+    assert any("follow-up clue" in item for item in validated.validation_signals)
+    assert any("thread-level clue" in item for item in validated.validation_signals)
+
+
+def test_validate_result_uses_delivery_semantics_for_token_only_clue():
+    intent = parse_intent("进击的巨人", explicit_kind="anime")
+    result = SearchResult(
+        channel="pan",
+        source="future-pan",
+        provider="baidu",
+        title="进击的巨人最终季",
+        link_or_magnet="future://token/abc",
+        raw={"delivery": "token_only", "requires_follow_up": True},
+    )
+    validated = validate_result(result, intent)
+    assert validated.validation_status == "clue"
+    assert validated.actionability == "clue"
+    assert any("token-only result" in item for item in validated.validation_signals)
+    assert any("final share URL may require follow-up" in item for item in validated.validation_signals)
+
+
+def test_format_search_text_renders_generic_follow_up_note():
+    text = format_search_text(
+        {
+            "query": "赤橙黄绿青蓝紫 1982",
+            "intent": {"kind": "movie"},
+            "plan": {"channels": ["pan"], "notes": []},
+            "results": [
+                SearchResult(
+                    channel="pan",
+                    source="tieba",
+                    provider="baidu_clue",
+                    title="赤橙黄绿青蓝紫",
+                    link_or_magnet="https://tieba.baidu.com/p/123",
+                    password="y3bq",
+                    validation_status="clue",
+                    actionability="clue",
+                    match_bucket="title_family_match",
+                    confidence=0.9,
+                    score=41,
+                    raw={"delivery": "thread_clue", "requires_follow_up": True},
+                ).to_public_dict()
+            ],
+            "warnings": [],
+            "source_status": [],
+            "meta": {},
+        }
+    )
+    assert "thread-level clue; open the thread and recover the final resource manually" in text
 
 
 def test_fuse_result_evidence_promotes_corroborated_result():

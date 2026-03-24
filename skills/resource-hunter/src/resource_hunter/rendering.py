@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .common import result_follow_up_note
 from .ranking import BUCKET_LABELS
 from .video_core import format_video_text
 
@@ -79,8 +80,9 @@ def format_search_text(response: dict[str, Any], max_results: int | None = None)
                 lines.append(f"  {result['link_or_magnet']}")
                 if result["password"]:
                     lines.append(f"  password: {result['password']}")
-                if result.get("source") == "dalipan" and str(result.get("link_or_magnet", "")).startswith("dalipan://"):
-                    lines.append("  note: token-only Dalipan clue; final share URL may require follow-up")
+                follow_up_note = result_follow_up_note(result.get("raw") or {})
+                if follow_up_note:
+                    lines.append(f"  note: {follow_up_note}")
                 if result.get("validation_signals"):
                     lines.append("  validation: " + ", ".join(result["validation_signals"][:4]))
                 if result["reasons"]:

@@ -70,7 +70,13 @@ All adapter outputs must already be normalized into the shared `SearchResult` st
 - `DaliPan` is currently a **structured token-only clue source** in runtime semantics:
   - anonymous search is confirmed via the public search API
   - final anonymous detail/url resolution is still incomplete
-  - runtime therefore exposes `dalipan://provider/eu-token` placeholders and marks them as clue/follow-up results rather than guaranteed final share URLs
+  - runtime therefore defaults to `dalipan://provider/eu-token` placeholders and marks them as clue/follow-up results rather than guaranteed final share URLs
+  - transport hardening now keeps insecure SSL fallback limited to SSL/certificate-like failures on the public search request
+  - optional detail/url follow-up can be attempted without making follow-up success a requirement for preserving search results
+- `PanSearch` is now viable as a low-priority structured pan source when queried with `keyword=`:
+  - `__NEXT_DATA__` and `_next/data` expose stable result payloads for current live probes
+  - content cards can contain embedded canonical share URLs that normalize into direct/actionable results
+  - it remains lower priority than proven direct aggregators because card structure may still drift
 
 ## Cache
 
@@ -128,6 +134,14 @@ The runtime uses these fields to separate:
 - actionable but not fully direct matches
 - clue-only results that still require manual follow-up
 
+The preferred generic clue/follow-up fields are:
+
+- `raw.retrieval_role=clue`
+- `raw.requires_follow_up=true`
+- `raw.delivery` for clue shape classification (`token_only`, `thread_clue`, `indexed_clue`)
+
+This lets ranking and rendering rely on result semantics rather than source-name-only branching.
+
 ### Dalipan-specific note
 
 Dalipan results currently preserve follow-up data in `raw`, including:
@@ -138,6 +152,34 @@ Dalipan results currently preserve follow-up data in `raw`, including:
 - `delivery=token_only`
 - `retrieval_role=clue`
 - `requires_follow_up=true`
+- `dalipan_transport.search=verified|insecure_fallback`
+- `dalipan_follow_up.detail_status`
+- `dalipan_follow_up.final_url_status`
+
+When optional follow-up is enabled, Dalipan may resolve to a direct resource, but unresolved/auth-gated follow-up must not invalidate the public search batch.
+
+This preserves the main success-first rule:
+
+- public search success must survive follow-up failure or follow-up disablement
+
+PanSearch direct records preserve source-specific context in `raw`, including:
+
+- `pansearch_id`
+- `pansearch_pan`
+- `pansearch_time`
+- `pansearch_card_title`
+
+## Admission and release safety guidance
+
+To keep expansion work reviewable and low-risk, each new source should be evaluated against a fixed admission checklist:
+
+- anonymous/public availability
+- stable canonical field or honest clue-only field contract
+- success / empty / error-or-drift fixture coverage
+- result-local failure isolation
+- synchronized updates to planner, retrieval layer metadata, source priority, and compatibility exports
+
+Release success should also be evaluated against **validated direct** results rather than any non-clue direct-looking candidate. This is especially important for same-title different-year trap cases such as `The Merry Widow 1952`.
 
 This makes current behavior explicit to downstream consumers.
 

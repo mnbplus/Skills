@@ -43,10 +43,13 @@ TRACKERS = (
 )
 
 RESOURCE_URL_RE = re.compile(r"(https?://[^\s\"'<>]+|magnet:\?[^\s\"'<>]+|ed2k://[^\s\"'<>]+)", re.I)
+PANSEARCH_NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
 TIEBA_PAN_CLUE_RE = re.compile(
     r"(?:通过百度网盘分享的文件|百度网盘分享的文件|网盘分享的文件)[:：]\s*(?P<title>[^\n\r<]{1,120})",
     re.I,
 )
+PANSEARCH_TITLE_LINE_RE = re.compile(r"^[^A-Za-z0-9\u4e00-\u9fff]*?(?:剧名|中文名|片名|标题|资源名称|原版名称|名称|别名)[:： ]*(?P<title>.+)$")
+PANSEARCH_SKIP_LINE_TERMS = ("http://", "https://", "分享链接", "链接", "频道投稿", "来自频道", "讨论群组", "官方网站")
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,7 @@ class SourceRuntimeProfile:
 SOURCE_RUNTIME_PROFILES: dict[str, SourceRuntimeProfile] = {
     "2fun": SourceRuntimeProfile(timeout=10, retries=1, degraded_score_penalty=0, cooldown_seconds=180, failure_threshold=2),
     "hunhepan": SourceRuntimeProfile(timeout=5, retries=0, degraded_score_penalty=18, cooldown_seconds=90, failure_threshold=1, default_degraded=True),
+    "pansearch": SourceRuntimeProfile(timeout=8, retries=0, degraded_score_penalty=8, cooldown_seconds=120, failure_threshold=1, default_degraded=True),
     "pansou.vip": SourceRuntimeProfile(timeout=5, retries=0, degraded_score_penalty=20, cooldown_seconds=90, failure_threshold=1, default_degraded=True),
     "tieba": SourceRuntimeProfile(timeout=8, retries=0, degraded_score_penalty=10, cooldown_seconds=120, failure_threshold=1, default_degraded=True),
     "nyaa": SourceRuntimeProfile(timeout=8, retries=1, degraded_score_penalty=0, cooldown_seconds=180, failure_threshold=2),
@@ -460,6 +464,118 @@ def _flatten_pan_payload(payload: dict[str, Any], source_name: str) -> list[Sear
     return results
 
 
+def _extract_pansearch_resource_results(content: str, *, source_name: str, default_title: str = "") -> list[SearchResult]:
+    decoded = html.unescape(content or "")
+    if not decoded:
+        return []
+    lines = [normalize_title(re.sub(r"<[^>]+>", " ", line)) for line in decoded.splitlines()]
+    title_hints: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        match = PANSEARCH_TITLE_LINE_RE.match(line)
+        if match:
+            candidate = normalize_title(match.group("title"))
+            if candidate:
+                title_hints.append(candidate)
+        elif default_title and any(term in line for term in PANSEARCH_SKIP_LINE_TERMS):
+            continue
+        elif not title_hints and default_title:
+            title_hints.append(default_title)
+
+    deduped_hints = unique_preserve([item for item in title_hints if item])
+    title_parts: list[str] = []
+    for candidate in deduped_hints:
+        candidate_key = normalize_key(candidate)
+        if not candidate_key:
+            continue
+        if any(candidate_key == normalize_key(existing) or candidate_key in normalize_key(existing) for existing in title_parts):
+            continue
+        title_parts.append(candidate)
+        if len(title_parts) >= 3:
+            break
+
+    title_hint = compact_spaces(" ".join(title_parts)) or default_title
+    return _extract_embedded_resource_results(
+        decoded,
+        source_name=source_name,
+        title_hint=title_hint or default_title or "PanSearch result",
+        thread_url="",
+    )
+
+
+class PanSearchSource(SourceAdapter):
+    name = "pansearch"
+    channel = "pan"
+    priority = 3
+
+    def _fetch_payload(self, query: str, http_client: HTTPClient) -> dict[str, Any]:
+        page_url = "https://www.pansearch.me/search?" + urllib.parse.urlencode({"keyword": query})
+        html_text = http_client.get_text(page_url, timeout=8)
+        match = PANSEARCH_NEXT_DATA_RE.search(html_text)
+        if not match:
+            raise SchemaError("pansearch missing __NEXT_DATA__", source=self.name, url=page_url)
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            raise SchemaError(f"invalid pansearch __NEXT_DATA__: {exc}", source=self.name, url=page_url) from exc
+        page_props = payload.get("props", {}).get("pageProps") or {}
+        data = page_props.get("data")
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            return data
+
+        build_id = str(payload.get("buildId") or "")
+        if not build_id:
+            raise SchemaError("pansearch payload missing buildId", source=self.name, url=page_url)
+        data_url = (
+            f"https://www.pansearch.me/_next/data/{build_id}/search.json?"
+            + urllib.parse.urlencode({"keyword": query})
+        )
+        json_payload = http_client.get_json(data_url, timeout=8)
+        data = json_payload.get("pageProps", {}).get("data") if isinstance(json_payload, dict) else None
+        if not isinstance(data, dict):
+            raise SchemaError("unexpected pansearch payload shape", source=self.name, url=data_url)
+        return data
+
+    def search(self, query: str, intent: SearchIntent, limit: int, page: int, http_client: HTTPClient) -> list[SearchResult]:
+        payload = self._fetch_payload(query, http_client)
+        items = payload.get("data") or []
+        if not isinstance(items, list):
+            raise SchemaError("unexpected pansearch results shape", source=self.name)
+
+        results: list[SearchResult] = []
+        seen: set[str] = set()
+        for item in items[: max(limit * 3, 18)]:
+            if not isinstance(item, dict):
+                continue
+            card_title = normalize_title(item.get("title") or "")
+            extracted = _extract_pansearch_resource_results(
+                item.get("content") or "",
+                source_name=self.name,
+                default_title=card_title or intent.query,
+            )
+            for entry in extracted:
+                key = f"{entry.provider}:{entry.share_id_or_info_hash}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_raw = dict(entry.raw)
+                merged_raw.update(
+                    {
+                        "pansearch_id": item.get("id"),
+                        "pansearch_pan": item.get("pan", ""),
+                        "pansearch_time": item.get("time", ""),
+                        "pansearch_card_title": card_title,
+                        "pansearch_image": item.get("image", ""),
+                    }
+                )
+                entry.raw = merged_raw
+                results.append(entry)
+                if len(results) >= max(limit * 2, 8):
+                    return results
+        return results
+
+
 class TwoFunSource(SourceAdapter):
     name = "2fun"
     channel = "pan"
@@ -578,7 +694,13 @@ def _extract_tieba_clue_results(
             share_id_or_info_hash=normalize_key(thread_url)[:32],
             quality=quality_display_from_tags(quality_tags),
             quality_tags=quality_tags,
-            raw={"thread_url": thread_url, "manual_follow_up": True},
+            raw={
+                "thread_url": thread_url,
+                "manual_follow_up": True,
+                "delivery": "thread_clue",
+                "retrieval_role": "clue",
+                "requires_follow_up": True,
+            },
         )
     ]
 
@@ -739,31 +861,151 @@ class DaliPanSource(SourceAdapter):
     channel = "pan"
     priority = 2
 
-    def search(self, query: str, intent: SearchIntent, limit: int, page: int, http_client: HTTPClient) -> list[SearchResult]:
-        def _load_payload() -> dict[str, Any]:
-            try:
-                payload = http_client.get_json(url, timeout=12)
-                if isinstance(payload, dict):
-                    return payload
-                raise SchemaError(f"invalid dalipan payload type: {type(payload).__name__}", source=self.name, url=url)
-            except Exception as primary_error:
-                request = urllib.request.Request(url, headers=DEFAULT_HEADERS | {"Accept": "application/json"})
-                try:
-                    with urllib.request.urlopen(request, timeout=12, context=ssl._create_unverified_context()) as response:
-                        payload = json.loads(
-                            response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
-                        )
-                except json.JSONDecodeError as exc:
-                    raise SchemaError(f"invalid json from {url}: {exc}", source=self.name, url=url) from exc
-                except Exception as insecure_error:
-                    message = str(insecure_error) or str(primary_error) or "request failed"
-                    raise NetworkError(message, source=self.name, url=url) from insecure_error
-                if not isinstance(payload, dict):
-                    raise SchemaError(
-                        f"invalid dalipan payload type: {type(payload).__name__}", source=self.name, url=url
-                    )
-                return payload
+    def __init__(self, *, enable_detail_follow_up: bool = False, enable_final_url_follow_up: bool = False) -> None:
+        self.enable_detail_follow_up = enable_detail_follow_up
+        self.enable_final_url_follow_up = enable_final_url_follow_up
 
+    def _should_try_insecure_fallback(self, error: Exception) -> bool:
+        failure_kind = str(getattr(error, "failure_kind", "") or "").lower()
+        if failure_kind and failure_kind not in {"network", ""}:
+            return False
+        lowered = str(error or "").lower()
+        return any(token in lowered for token in ("ssl", "tls", "certificate", "cert"))
+
+    def _get_json_via_insecure_transport(self, url: str, *, timeout: int = 12) -> Any:
+        request = urllib.request.Request(url, headers=DEFAULT_HEADERS | {"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=ssl._create_unverified_context()) as response:
+                payload = response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+        except Exception as exc:
+            raise NetworkError(str(exc) or "request failed", source=self.name, url=url) from exc
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise SchemaError(f"invalid json from {url}: {exc}", source=self.name, url=url) from exc
+
+    def _load_json_payload(
+        self,
+        url: str,
+        http_client: HTTPClient,
+        *,
+        allow_insecure_fallback: bool = False,
+    ) -> tuple[Any, str]:
+        try:
+            return http_client.get_json(url, timeout=12), "verified"
+        except Exception as primary_error:
+            if not allow_insecure_fallback or not self._should_try_insecure_fallback(primary_error):
+                raise
+            return self._get_json_via_insecure_transport(url, timeout=12), "insecure_fallback"
+
+    def _extract_public_resource(self, payload: Any) -> dict[str, str] | None:
+        candidates: list[str] = []
+
+        def _collect(value: Any) -> None:
+            if isinstance(value, str):
+                candidates.append(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    _collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    _collect(item)
+
+        _collect(payload)
+        for text in candidates:
+            decoded = html.unescape(text)
+            for match in RESOURCE_URL_RE.finditer(decoded):
+                raw_url = match.group(1).rstrip(".,);]>\"'")
+                cleaned_url = clean_share_url(raw_url)
+                if not cleaned_url:
+                    continue
+                provider = infer_provider_from_url(cleaned_url)
+                if provider == "other":
+                    continue
+                return {
+                    "provider": provider,
+                    "link_or_magnet": cleaned_url,
+                    "password": extract_password(decoded) or extract_password(cleaned_url),
+                    "share_id_or_info_hash": extract_share_id(cleaned_url, provider_hint=provider),
+                }
+        return None
+
+    def _payload_requires_auth(self, payload: Any) -> bool:
+        if payload in {-1, "-1"}:
+            return True
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            if code in {-1, 401, 403}:
+                return True
+            message = compact_spaces(
+                str(payload.get("message") or payload.get("msg") or payload.get("error") or payload.get("detail") or "")
+            ).lower()
+            return any(token in message for token in ("login", "token", "authorize", "授权", "登录", "会员"))
+        if isinstance(payload, str):
+            lowered = compact_spaces(payload).lower()
+            return any(token in lowered for token in ("login", "token", "authorize", "授权", "登录", "会员"))
+        return False
+
+    def _follow_up_status_from_error(self, error: Exception) -> str:
+        failure_kind = str(getattr(error, "failure_kind", "") or "").lower()
+        if failure_kind:
+            return failure_kind
+        lowered = str(error or "").lower()
+        if any(token in lowered for token in ("login", "token", "authorize", "授权", "登录")):
+            return "auth_required"
+        return "error"
+
+    def _optional_follow_up(self, resource: dict[str, Any], http_client: HTTPClient) -> tuple[dict[str, Any], dict[str, str] | None]:
+        meta: dict[str, Any] = {
+            "detail_status": "disabled" if not self.enable_detail_follow_up else "not_attempted",
+            "final_url_status": "disabled" if not self.enable_final_url_follow_up else "not_attempted",
+        }
+        resolved: dict[str, str] | None = None
+
+        if self.enable_detail_follow_up and resource.get("id"):
+            detail_url = "https://api.dalipan.com/api/v1/pan/detail?" + urllib.parse.urlencode(
+                {"id": resource.get("id"), "size": 15, "type": resource.get("type") or ""}
+            )
+            try:
+                detail_payload, detail_transport = self._load_json_payload(
+                    detail_url,
+                    http_client,
+                    allow_insecure_fallback=True,
+                )
+                meta["detail_transport"] = detail_transport
+                resolved = self._extract_public_resource(detail_payload)
+                if resolved:
+                    meta["detail_status"] = "resolved"
+                elif self._payload_requires_auth(detail_payload):
+                    meta["detail_status"] = "auth_required"
+                else:
+                    meta["detail_status"] = "unresolved"
+            except Exception as exc:
+                meta["detail_status"] = self._follow_up_status_from_error(exc)
+                meta["detail_error"] = str(exc)[:120]
+
+        if resolved is None and self.enable_final_url_follow_up and resource.get("id"):
+            final_url = "https://api.dalipan.com/api/v1/pan/url?" + urllib.parse.urlencode({"id": resource.get("id")})
+            try:
+                final_payload, final_transport = self._load_json_payload(
+                    final_url,
+                    http_client,
+                    allow_insecure_fallback=True,
+                )
+                meta["final_url_transport"] = final_transport
+                resolved = self._extract_public_resource(final_payload)
+                if resolved:
+                    meta["final_url_status"] = "resolved"
+                elif self._payload_requires_auth(final_payload):
+                    meta["final_url_status"] = "auth_required"
+                else:
+                    meta["final_url_status"] = "unresolved"
+            except Exception as exc:
+                meta["final_url_status"] = self._follow_up_status_from_error(exc)
+                meta["final_url_error"] = str(exc)[:120]
+        return meta, resolved
+
+    def search(self, query: str, intent: SearchIntent, limit: int, page: int, http_client: HTTPClient) -> list[SearchResult]:
         params = {
             "kw": query,
             "page": page or 1,
@@ -771,7 +1013,10 @@ class DaliPanSource(SourceAdapter):
             "site": "dalipan",
         }
         url = "https://api.dalipan.com/api/v1/pan/search?" + urllib.parse.urlencode(params)
-        resources = (_load_payload().get("resources") or [])
+        payload, search_transport = self._load_json_payload(url, http_client, allow_insecure_fallback=True)
+        if not isinstance(payload, dict):
+            raise SchemaError(f"invalid dalipan payload type: {type(payload).__name__}", source=self.name, url=url)
+        resources = (payload.get("resources") or [])
         results: list[SearchResult] = []
         for item in resources[: max(limit * 3, 18)]:
             res = item.get("res") or {}
@@ -786,26 +1031,36 @@ class DaliPanSource(SourceAdapter):
             if not access_token:
                 continue
             quality_tags = parse_quality_tags(title)
+            follow_up_meta, resolved = self._optional_follow_up(res, http_client)
+            resolved_provider = resolved["provider"] if resolved else provider
+            resolved_link = resolved["link_or_magnet"] if resolved else f"dalipan://{provider}/{access_token}"
+            resolved_share_id = resolved["share_id_or_info_hash"] if resolved else str(res.get("id") or access_token)
+            delivery = "resolved_url" if resolved else "token_only"
+            retrieval_role = "" if resolved else "clue"
+            requires_follow_up = not bool(resolved)
             results.append(
                 SearchResult(
-                    channel="pan",
+                    channel="torrent" if resolved_provider in {"magnet", "ed2k"} else "pan",
                     source=self.name,
-                    provider=provider,
+                    provider=resolved_provider,
                     title=title,
-                    link_or_magnet=f"dalipan://{provider}/{access_token}",
-                    share_id_or_info_hash=str(res.get("id") or access_token),
+                    link_or_magnet=resolved_link,
+                    password=resolved["password"] if resolved else "",
+                    share_id_or_info_hash=resolved_share_id,
                     size=_format_size(res.get("size", 0)),
                     quality=quality_display_from_tags(quality_tags),
                     quality_tags=quality_tags,
                     raw={
                         "dalipan_id": res.get("id", ""),
+                        "dalipan_transport": {"search": search_transport},
+                        "dalipan_follow_up": follow_up_meta,
                         "dalipan_eu": access_token,
                         "ctime": res.get("ctime", ""),
                         "updatetime": res.get("updatetime", ""),
                         "filelist": res.get("filelist", []),
-                        "delivery": "token_only",
-                        "retrieval_role": "clue",
-                        "requires_follow_up": True,
+                        "delivery": delivery,
+                        "retrieval_role": retrieval_role,
+                        "requires_follow_up": requires_follow_up,
                     },
                 )
             )
@@ -1061,6 +1316,7 @@ class OneThreeThreeSevenXSource(SourceAdapter):
 __all__ = [
     "AliasResolver",
     "DEFAULT_HEADERS",
+    "PANSEARCH_NEXT_DATA_RE",
     "AnimeToshoSource",
     "DaliPanSource",
     "DMHYSource",
@@ -1069,6 +1325,7 @@ __all__ = [
     "HunhepanSource",
     "NyaaSource",
     "OneThreeThreeSevenXSource",
+    "PanSearchSource",
     "PansouVipSource",
     "TorlockSource",
     "RESOURCE_URL_RE",
@@ -1084,6 +1341,7 @@ __all__ = [
     "_clean_magnet",
     "_extract_embedded_resource_results",
     "_extract_tieba_clue_results",
+    "_extract_pansearch_resource_results",
     "_flatten_pan_payload",
     "_format_size",
     "_make_magnet",

@@ -19,7 +19,7 @@ from .models import QueryPlanEntry, SearchIntent, SearchPlan
 
 
 _SOURCE_FAMILIES: dict[str, list[str]] = {
-    "pan": ["2fun", "dalipan", "hunhepan", "pansou.vip", "tieba"],
+    "pan": ["2fun", "dalipan", "pansearch", "hunhepan", "pansou.vip", "tieba"],
     "torrent": ["nyaa", "animetosho", "dmhy", "eztv", "tpb", "torlock", "yts", "1337x"],
 }
 
@@ -67,11 +67,11 @@ def _build_query_entries(
                     sources = ["tpb", "torlock", "1337x", "yts", "eztv"]
         else:
             if stage == "strict":
-                sources = ["2fun", "dalipan", "hunhepan", "pansou.vip"]
+                sources = ["2fun", "dalipan", "pansearch", "hunhepan", "pansou.vip"]
             elif stage == "alias":
-                sources = ["2fun", "dalipan", "hunhepan", "pansou.vip", "tieba"]
+                sources = ["2fun", "dalipan", "pansearch", "hunhepan", "pansou.vip", "tieba"]
             else:
-                sources = ["tieba", "dalipan", "2fun", "hunhepan", "pansou.vip"]
+                sources = ["tieba", "dalipan", "pansearch", "2fun", "hunhepan", "pansou.vip"]
         entries.append(
             QueryPlanEntry(
                 query=normalized_query,
@@ -112,7 +112,7 @@ def _build_query_budgets(entries: list[QueryPlanEntry], *, preferred_sources: li
         budget = 2
         if channel == "torrent" and kind in {"anime", "tv", "movie"} and source in {"nyaa", "animetosho", "dmhy", "eztv", "yts"}:
             budget = 3
-        if source in {"tieba", "pansou.vip", "hunhepan", "1337x", "torlock", "dalipan"}:
+        if source in {"tieba", "pansou.vip", "hunhepan", "1337x", "torlock", "dalipan", "pansearch"}:
             budget = 2 if salvage_count else 1
         budgets[source] = max(1, min(budget, strict_count + alias_count + salvage_count or 1))
     return budgets
@@ -252,19 +252,19 @@ def build_plan(intent: SearchIntent) -> SearchPlan:
     plan = SearchPlan(channels=channels, notes=[])
 
     if intent.kind == "anime":
-        plan.preferred_pan_sources = ["dalipan", "2fun", "hunhepan", "pansou.vip", "tieba"]
+        plan.preferred_pan_sources = ["dalipan", "2fun", "pansearch", "hunhepan", "pansou.vip", "tieba"]
         plan.preferred_torrent_sources = ["nyaa", "animetosho", "dmhy", "torlock", "tpb", "1337x", "yts", "eztv"]
         plan.notes.append("anime prefers nyaa before pan sources")
     elif intent.kind == "tv":
-        plan.preferred_pan_sources = ["dalipan", "2fun", "hunhepan", "pansou.vip", "tieba"]
+        plan.preferred_pan_sources = ["dalipan", "2fun", "pansearch", "hunhepan", "pansou.vip", "tieba"]
         plan.preferred_torrent_sources = ["eztv", "torlock", "tpb", "1337x", "nyaa", "yts"]
         plan.notes.append("tv prefers eztv/tpb before pan sources")
     elif intent.kind == "movie":
-        plan.preferred_pan_sources = ["dalipan", "2fun", "hunhepan", "pansou.vip", "tieba"]
+        plan.preferred_pan_sources = ["dalipan", "2fun", "pansearch", "hunhepan", "pansou.vip", "tieba"]
         plan.preferred_torrent_sources = ["yts", "torlock", "tpb", "1337x", "eztv", "nyaa"]
         plan.notes.append("movie prefers pan results, then yts/tpb torrents")
     else:
-        plan.preferred_pan_sources = ["dalipan", "2fun", "hunhepan", "pansou.vip", "tieba"]
+        plan.preferred_pan_sources = ["dalipan", "2fun", "pansearch", "hunhepan", "pansou.vip", "tieba"]
         plan.preferred_torrent_sources = ["tpb", "1337x", "nyaa", "eztv", "yts"]
         plan.notes.append("general/software/music/book prefer pan results first")
 

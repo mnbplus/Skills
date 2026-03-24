@@ -350,6 +350,49 @@ def test_the_merry_widow_1952_wrong_year_result_is_not_direct_validated(tmp_path
     assert wrong_year.actionability == "speculative"
 
 
+def test_the_merry_widow_1952_conflict_result_does_not_count_as_success_direct(tmp_path):
+    cache = ResourceCache(tmp_path / "cache.db")
+    engine = ResourceHunterEngine(cache=cache)
+    engine.pan_sources = []
+    engine.torrent_sources = [
+        FakeSource(
+            "tpb",
+            "torrent",
+            2,
+            [
+                SearchResult(
+                    channel="torrent",
+                    source="tpb",
+                    provider="magnet",
+                    title="The Merry Widow 1934 720p WebDL X264",
+                    link_or_magnet="magnet:?xt=urn:btih:abc",
+                    share_id_or_info_hash="abc",
+                    seeders=25,
+                )
+            ],
+        )
+    ]
+    response = engine.search(parse_intent("The Merry Widow 1952", explicit_kind="movie"), use_cache=False)
+    assert response["meta"]["success_estimate"]["has_direct"] is False
+    assert response["meta"]["success_estimate"]["has_actionable"] is False
+    assert response["meta"]["best_direct_results"] == []
+    assert response["meta"]["best_validated_results"] == []
+    assert response["meta"]["best_actionable_results"] == []
+    assert response["results"][0]["validation_status"] == "conflict"
+    assert response["results"][0]["actionability"] == "speculative"
+
+
+def test_known_hard_case_still_keeps_clue_channel_visible_when_only_weak_context_exists(tmp_path):
+    cache = ResourceCache(tmp_path / "cache.db")
+    engine = ResourceHunterEngine(cache=cache)
+    engine.pan_sources = []
+    engine.torrent_sources = [FakeSource("tpb", "torrent", 2, [SearchResult(channel="torrent", source="tpb", provider="magnet", title="Merry Widow behind the scenes archive", link_or_magnet="magnet:?xt=urn:btih:def", share_id_or_info_hash="def")])]
+    response = engine.search(parse_intent("The Merry Widow 1952", explicit_kind="movie"), use_cache=False)
+    assert response["meta"]["success_estimate"]["has_clues"] is False
+    assert response["results"][0]["match_bucket"] in {"weak_context_match", "title_family_match"}
+    assert response["results"][0]["validation_status"] != "validated"
+
+
 def test_default_degraded_source_recovers_after_probe_or_real_success(tmp_path):
     cache = ResourceCache(tmp_path / "cache.db")
     assert pc._source_is_degraded(cache, "yts") is True

@@ -10,6 +10,10 @@ from .cache import ResourceCache
 from .common import (
     extract_year,
     normalize_key,
+    result_delivery,
+    result_follow_up_note,
+    result_is_clue,
+    result_requires_follow_up,
     parse_quality_tags,
     quality_display_from_tags,
     source_priority,
@@ -219,32 +223,33 @@ def validate_result(result: SearchResult, intent: SearchIntent) -> SearchResult:
         actionability = "actionable"
         validation_signals.append("year missing: downgraded from direct to actionable")
 
-    if result.raw.get("manual_follow_up"):
+    if result_requires_follow_up(result.raw):
         status = "clue"
         actionability = "clue"
-        validation_signals.append("manual follow-up clue")
+        validation_signals.append("follow-up clue")
         score_bonus -= 8
     if result.raw.get("layer") == "indexed-discovery":
         validation_signals.append("indexed discovery fallback")
         actionability = "actionable" if actionability == "speculative" else actionability
         score_bonus -= 4
-    if result.raw.get("retrieval_role") == "clue":
+    if result_is_clue(result.raw):
         status = "clue"
         actionability = "clue"
         validation_signals.append("clue-only retrieval role")
         score_bonus -= 6
     if result.password:
         validation_signals.append("includes extraction code")
-        if actionability in {"speculative", "clue"}:
+        if actionability in {"speculative", "clue"} and not result_requires_follow_up(result.raw):
             actionability = "actionable"
         score_bonus += 3
     if result.source == "search-index":
         validation_signals.append("search-index result")
         score_bonus -= 3
-    if result.source == "dalipan" and result.raw.get("delivery") == "token_only":
+    delivery = result_delivery(result.raw)
+    if delivery == "token_only":
         status = "clue"
         actionability = "clue"
-        validation_signals.append("dalipan token-only result")
+        validation_signals.append("token-only result")
         score_bonus -= 10
     if result.provider in {"tieba_thread", "baidu_clue"}:
         validation_signals.append("community thread clue")
@@ -254,12 +259,13 @@ def validate_result(result: SearchResult, intent: SearchIntent) -> SearchResult:
             actionability = "clue"
         score_bonus -= 5
 
-    title_conflict = result.raw.get("retrieval_role") == "clue" or result.raw.get("manual_follow_up")
-    if title_conflict:
+    if result_is_clue(result.raw) or result_requires_follow_up(result.raw):
         result.penalties.append("clue result requires follow-up")
     if result.match_bucket == "weak_context_match" and result.source not in {"search-index", "tieba"}:
         result.penalties.append("result lacks sufficient alignment")
         score_bonus -= 8
+    if result_follow_up_note(result.raw):
+        validation_signals.append(result_follow_up_note(result.raw))
     if result.match_bucket == "title_family_match" and result.provider == "other":
         validation_signals.append("provider unresolved")
         score_bonus -= 4

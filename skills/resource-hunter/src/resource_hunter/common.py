@@ -180,6 +180,13 @@ DOMAIN_PROVIDER_MAP = {
     "lanzouq.com": "lanzou",
 }
 
+CLUE_ONLY_DELIVERIES = {
+    "token_only",
+    "thread_clue",
+    "indexed_clue",
+}
+
+
 PLATFORM_MAP = {
     "youtube.com": "YouTube",
     "youtu.be": "YouTube",
@@ -465,6 +472,7 @@ def source_priority(source_name: str) -> int:
     priorities = {
         "2fun": 1,
         "dalipan": 1,
+        "pansearch": 2,
         "hunhepan": 2,
         "pansou.vip": 3,
         "tieba": 4,
@@ -507,4 +515,43 @@ def quality_display_from_tags(tags: dict[str, Any]) -> str:
         return "lossless"
     if tags.get("resolution"):
         return tags["resolution"]
+    return ""
+
+
+def result_delivery(raw: dict[str, Any]) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    delivery = compact_spaces(str(raw.get("delivery") or "")).lower().replace(" ", "_")
+    if delivery:
+        return delivery
+    if raw.get("manual_follow_up"):
+        return "thread_clue"
+    return ""
+
+
+def result_requires_follow_up(raw: dict[str, Any]) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("requires_follow_up") or raw.get("manual_follow_up"):
+        return True
+    return result_delivery(raw) in CLUE_ONLY_DELIVERIES
+
+
+def result_is_clue(raw: dict[str, Any]) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    retrieval_role = compact_spaces(str(raw.get("retrieval_role") or "")).lower()
+    return retrieval_role == "clue" or result_delivery(raw) in CLUE_ONLY_DELIVERIES
+
+
+def result_follow_up_note(raw: dict[str, Any]) -> str:
+    delivery = result_delivery(raw)
+    if delivery == "token_only":
+        return "token-only clue; final share URL may require follow-up"
+    if delivery == "thread_clue":
+        return "thread-level clue; open the thread and recover the final resource manually"
+    if delivery == "indexed_clue":
+        return "indexed clue; open the result page and follow up manually"
+    if result_requires_follow_up(raw):
+        return "follow-up required before the final resource is usable"
     return ""

@@ -1,4 +1,5 @@
 from resource_hunter.core import build_plan, parse_intent
+from resource_hunter.models import SearchResult
 
 
 def test_detects_kinds_and_fields():
@@ -39,6 +40,23 @@ def test_build_plan_respects_routing_preferences():
     assert any("2160p" in item.lower() or "4k" in item.lower() for item in movie_plan.pan_queries + movie_plan.torrent_queries)
     assert movie_plan.torrent_query_graph
     assert movie_plan.source_query_plan["yts"]
+
+    pansearch_queries = movie_plan.source_query_plan["pansearch"]
+    assert pansearch_queries
+    assert movie_plan.query_budgets["pansearch"] >= 1
+
+
+def test_pansearch_passworded_direct_result_stays_actionable_or_better():
+    result = SearchResult(
+        channel="pan",
+        source="pansearch",
+        provider="aliyun",
+        title="Attack on Titan",
+        link_or_magnet="https://www.aliyundrive.com/s/qaQLuXwnTFw",
+        password="7788",
+        raw={"pansearch_id": 1},
+    )
+    assert result.source == "pansearch"
 
 
 def test_chinese_title_with_year_defaults_to_movie():

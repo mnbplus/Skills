@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from resource_hunter.core import AnimeToshoSource, DaliPanSource, DMHYSource, ResourceHunterEngine, TorlockSource, build_plan, parse_intent, score_result, search_indexed_discovery
+from resource_hunter.core import AnimeToshoSource, DaliPanSource, DMHYSource, PanSearchSource, ResourceHunterEngine, TorlockSource, build_plan, parse_intent, score_result, search_indexed_discovery
 
 
 class FakeHTTPClient:
@@ -97,16 +97,24 @@ DALIPAN_JSON = """{
   "total": 1
 }"""
 
+PANSEARCH_HTML = r"""
+<html><body>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"data":{"total":2,"data":[{"id":29700,"content":"剧名：进击的巨人\n别名：Attack on Titan\n阿里云链接：<a class=\"resource-link\" target=\"_blank\" href=\"https://www.aliyundrive.com/s/qaQLuXwnTFw\">https://www.aliyundrive.com/s/qaQLuXwnTFw</a>\n提取码：7788","pan":"aliyundrive","image":"https://dl.pansearch.me/resources/1.jpg","time":"2021-11-13T10:54:40+08:00"},{"id":3227,"content":"中文名: 进击的巨人\n别名: Attack on Titan\n分享链接：\n<a class=\"resource-link\" target=\"_blank\" href=\"https://www.aliyundrive.com/s/RG1m85SWVpo\">https://www.aliyundrive.com/s/RG1m85SWVpo</a>","pan":"aliyundrive","image":"https://dl.pansearch.me/resources/2.jpg","time":"2021-08-06T08:03:48+08:00"}]},"limit":9},"__N_SSP":true},"page":"/search","query":{"keyword":"Attack on Titan"},"buildId":"b3d28aab680bcfde974b229185c6ca0fc8248c02"}</script>
+</body></html>
+"""
+
 
 def test_build_plan_prioritizes_new_anime_sources():
     anime = parse_intent("Attack on Titan", explicit_kind="anime")
     plan = build_plan(anime)
     assert plan.preferred_torrent_sources[:4] == ["nyaa", "animetosho", "dmhy", "torlock"]
     assert plan.preferred_pan_sources[0] == "dalipan"
+    assert "pansearch" in plan.preferred_pan_sources
     assert "animetosho" in plan.source_query_plan
     assert "dmhy" in plan.source_query_plan
     assert "torlock" in plan.source_query_plan
     assert "dalipan" in plan.source_query_plan
+    assert "pansearch" in plan.source_query_plan
 
 
 def test_engine_registers_new_torrent_sources():
@@ -117,6 +125,7 @@ def test_engine_registers_new_torrent_sources():
     assert "dmhy" in source_names
     assert "torlock" in source_names
     assert "dalipan" in pan_source_names
+    assert "pansearch" in pan_source_names
 
 
 def test_animetosho_source_parses_rss_feed():
@@ -200,12 +209,106 @@ def test_dalipan_source_parses_public_api_payload():
     assert results[0].source == "dalipan"
     assert results[0].provider == "baidu"
     assert results[0].raw["delivery"] == "token_only"
+    assert results[0].raw["requires_follow_up"] is True
     assert results[0].raw["retrieval_role"] == "clue"
+    assert results[0].raw["dalipan_transport"]["search"] in {"verified", "insecure_fallback"}
+    assert results[0].raw["dalipan_follow_up"]["detail_status"] == "disabled"
     scored = score_result(results[0], parse_intent("进击的巨人", explicit_kind="anime"))
     assert scored.validation_status == "clue"
     assert scored.actionability == "clue"
+    assert any("token-only result" in item for item in scored.validation_signals)
+    assert any("final share URL may require follow-up" in item for item in scored.validation_signals)
     assert results[0].link_or_magnet.startswith("dalipan://baidu/")
     assert results[0].raw["dalipan_id"]
+
+
+def test_dalipan_uses_insecure_fallback_only_for_ssl_like_failures():
+    class SSLFirstHTTPClient(FakeHTTPClient):
+        def __init__(self, mapping: dict[str, str]) -> None:
+            super().__init__(mapping)
+            self.json_calls = 0
+
+        def get_json(self, url: str, timeout: int | None = None):
+            self.json_calls += 1
+            raise RuntimeError("SSL: CERTIFICATE_VERIFY_FAILED")
+
+    source = DaliPanSource()
+    client = SSLFirstHTTPClient({"unused": "unused"})
+    results = source.search(
+        "进击的巨人",
+        parse_intent("进击的巨人", explicit_kind="anime"),
+        limit=5,
+        page=1,
+        http_client=client,
+    )
+    assert results
+    assert client.json_calls == 1
+    assert results[0].raw["dalipan_transport"]["search"] == "insecure_fallback"
+
+
+def test_dalipan_does_not_use_insecure_fallback_for_non_ssl_errors():
+    class HTTP403Client(FakeHTTPClient):
+        def get_json(self, url: str, timeout: int | None = None):
+            raise RuntimeError("HTTP 403")
+
+    source = DaliPanSource()
+    try:
+        source.search(
+            "进击的巨人",
+            parse_intent("进击的巨人", explicit_kind="anime"),
+            limit=5,
+            page=1,
+            http_client=HTTP403Client({}),
+        )
+        assert False, "expected non-ssl error to propagate"
+    except Exception as exc:
+        assert "403" in str(exc)
+
+
+def test_dalipan_optional_follow_up_auth_failure_stays_clue_only():
+    class FollowUpRestrictedClient(FakeHTTPClient):
+        def get_json(self, url: str, timeout: int | None = None):
+            if "api.dalipan.com/api/v1/pan/detail" in url:
+                from resource_hunter.errors import UpstreamError
+                raise UpstreamError("login required", failure_kind="auth_required")
+            if "api.dalipan.com/api/v1/pan/url" in url:
+                return -1
+            return super().get_json(url, timeout=timeout)
+
+    source = DaliPanSource(enable_detail_follow_up=True, enable_final_url_follow_up=True)
+    results = source.search(
+        "进击的巨人",
+        parse_intent("进击的巨人", explicit_kind="anime"),
+        limit=5,
+        page=1,
+        http_client=FollowUpRestrictedClient({"unused": "unused"}),
+    )
+    assert results
+    assert results[0].raw["delivery"] == "token_only"
+    assert results[0].raw["requires_follow_up"] is True
+    assert results[0].raw["dalipan_follow_up"]["detail_status"] == "auth_required"
+    assert results[0].raw["dalipan_follow_up"]["final_url_status"] == "auth_required"
+
+
+def test_pansearch_source_parses_next_data_cards_into_direct_results():
+    source = PanSearchSource()
+    results = source.search(
+        "Attack on Titan",
+        parse_intent("Attack on Titan", explicit_kind="anime"),
+        limit=5,
+        page=1,
+        http_client=FakeHTTPClient({"pansearch.me/search?keyword": PANSEARCH_HTML}),
+    )
+    assert results
+    assert results[0].source == "pansearch"
+    assert results[0].provider == "aliyun"
+    assert results[0].password == "7788"
+    assert results[0].link_or_magnet.startswith("https://www.aliyundrive.com/s/")
+    assert results[0].raw["pansearch_id"] == 29700
+    assert results[0].raw["pansearch_pan"] == "aliyundrive"
+    scored = score_result(results[0], parse_intent("Attack on Titan", explicit_kind="anime"))
+    assert scored.actionability in {"actionable", "direct"}
+    assert scored.validation_status in {"partial", "validated"}
 
 
 def test_indexed_discovery_uses_bing_and_brave_html_results():

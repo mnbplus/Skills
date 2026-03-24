@@ -35,7 +35,7 @@ LAYERED_RETRIEVAL_DEFINITIONS: list[RetrievalLayerDefinition] = [
         name="direct-structured-pan",
         channel="pan",
         role="direct",
-        sources=["2fun", "dalipan", "hunhepan", "pansou.vip"],
+        sources=["2fun", "dalipan", "pansearch", "hunhepan", "pansou.vip"],
         description="Structured pan aggregators and API-driven sources.",
     ),
     RetrievalLayerDefinition(
@@ -219,7 +219,8 @@ def search_indexed_discovery(
                         raw={
                             "query": query,
                             "layer": "indexed-discovery",
-                            "retrieval_role": role,
+                            "retrieval_role": role if role == "clue" else "",
+                            "delivery": "indexed_clue" if role == "clue" else "",
                             "indexed_title": item.get("title", ""),
                         },
                     )

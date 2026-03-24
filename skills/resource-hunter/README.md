@@ -73,7 +73,7 @@ python3 scripts/hunt.py video probe "https://www.bilibili.com/video/BV..."
 - public HTML/RSS sources can drift, throttle, or region-block without notice
 - same-title different-year disambiguation is improved but still not perfect
 - `The Merry Widow 1952` remains a known hard live case
-- `PanSearch` looks promising but is not yet integrated because content-card link extraction is still unfinished
+- `PanSearch` is now integrated through public `keyword=` search with `__NEXT_DATA__` / `_next/data` extraction, but card structure drift remains a risk
 
 ## References
 

@@ -16,6 +16,6 @@ Prepare and sync a source-expansion release of `resource-hunter` with clear capa
   - `DaliPan` currently provides structured clue records from anonymous search, not guaranteed final share URLs
   - `Bing` and `Brave` are best-effort indexed-discovery fallbacks
 - After sync, continue the next implementation wave in this order:
-  1. finish PanSearch content-card link extraction
-  2. revisit Dalipan detail/url completion and transport hardening
-  3. continue one-by-one probing for additional public no-API sources
+  1. continue Dalipan detail/url completion only if anonymous/public evidence improves
+  2. harden precision against same-title different-year trap cases and refresh release-gate evidence
+  3. continue one-by-one probing for additional public no-API sources under the new admission checklist
