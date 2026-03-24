@@ -1,6 +1,5 @@
 ---
 name: resource-hunter
-version: 2.1.1
 description: "Find the best public route to pan links, magnets, torrents, and public video URLs for movies, TV, anime, music, software, and books. Uses layered success-first retrieval, public HTML/RSS/no-API sources, and direct/actionable/clue result ranking."
 metadata: {"openclaw":{"emoji":"🔎"}}
 ---
